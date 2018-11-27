@@ -24,6 +24,9 @@ PERSISTENCE_GLOBAL_FILENAME = 'rta-global.data'
 # URL to a graft supernode.  Should not end in a /
 RTA_URL = 'http://localhost:29016'
 
+# URL to a graft node, typically the one the above RTA_URL supernode is connected to
+NODE_URL = 'http://localhost:28681'
+
 # Telegram handle of the bot's owner
 OWNER = 'FIXME'
 
@@ -411,6 +414,53 @@ def show_sn(bot, update, user_data, args):
 
 
 @needs_data
+@send_action(ChatAction.FIND_LOCATION)
+def show_sample(bot, update, user_data, args):
+    height, relative = None, False
+    if args:
+        if len(args) == 1 and re.match(r'^[+-]?\d+$', args[0]):
+            relative = args[0][0] in ('+', '-')
+            height = int(args[0])
+        else:
+            send_reply(bot, update, "❌ Bad arguments!\nUsage: /sample [HEIGHT|+N|-N] "
+                    "— shows auth sample for the current height, the given height, or current height ±N")
+            return
+
+    try:
+        curr_height = requests.get(NODE_URL + '/getheight').json()['height']
+    except Exception as e:
+        send_reply(bot, update, "⚠ *Something getting wrong* while getting current height 💩")
+        raise e
+
+    if height is None:
+        height = curr_height
+    elif relative:
+        height = curr_height + height
+        if height < 0:
+            send_reply(bot, update, "😝 I can't look up a block before the genesis block!")
+            return
+
+    if height >= curr_height + 20:
+        send_reply(bot, update, "🔮 Error: crystal ball malfunctioned; can't look up more than 19 blocks into the future")
+        return
+
+    try:
+        sample = requests.get(RTA_URL + '/debug/auth_sample/{}'.format(height), timeout=2).json()['result']['items']
+    except Exception as e:
+        send_reply(bot, update, "⚠ *Something getting wrong* while getting auth sample 🤢")
+        raise e
+
+    if not sample:
+        msg = "😧 *Something getting wrong*: auth sample for height {} return an empty list!".format(height)
+    else:
+        msg = "Auth sample for height {}:".format(height)
+        for sn in sample:
+            msg += " {} _(T{})_".format(format_wallet(sn['Address']), tier(sn['StakeAmount']))
+
+    send_reply(bot, update, msg)
+
+
+@needs_data
 def msg_input(bot, update, user_data):
     global last_stats
 
@@ -533,7 +583,6 @@ def send_stake(bot, update, user_data, args):
         print(e)
         send_reply(bot, update, "⚠ *Something getting wrong* while sending payment 💩", reply_to=reply_to)
         raise e
-        return
 
 
 @send_action(ChatAction.TYPING)
@@ -611,6 +660,7 @@ def main():
     updater.dispatcher.add_handler(CommandHandler('balance', balance, pass_user_data=True))
     updater.dispatcher.add_handler(CommandHandler('donate', donate, pass_user_data=True))
     updater.dispatcher.add_handler(CommandHandler('sn', show_sn, pass_user_data=True, pass_args=True))
+    updater.dispatcher.add_handler(CommandHandler('sample', show_sample, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(MessageHandler(Filters.text, msg_input, pass_user_data=True))
 
     # log all errors
