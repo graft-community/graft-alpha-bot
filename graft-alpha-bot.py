@@ -344,6 +344,8 @@ ADDR — queries the status of the given SN from the point of view of the bot's 
 
 /dist — shows the current active SN distribution across tiers.
 
+/sample — shows the auth sample for the current or a requested block.
+
 /balance — shows the balance of the bot's wallet for sending out test stakes.
 
 /donate — shows the bot's address (to help replenish the bot's available funds).
