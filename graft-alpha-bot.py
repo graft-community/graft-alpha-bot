@@ -196,6 +196,10 @@ def get_dist(stats = None):
     for t in (1, 2, 3, 4):
         dist += ('T{}: ' + blocks[t-1] + " ({} = {:.1f}%)\n").format(t, num_tiers[t], pct_tiers[t-1])
     dist += '{} supernode{} online and staked\n'.format(num_sns, 's' if num_sns != 1 else '')
+    dist += 'Uptimes: _{}_ ≤ 2m, _{}_ ≤ 10m, _{}_ ≤ 1h\n'.format(
+            sum(x['LastUpdateAge'] <= 2*60 for x in stats.values()),
+            sum(2*60 < x['LastUpdateAge'] <= 10*60 for x in stats.values()),
+            sum(10*60 < x['LastUpdateAge'] <= 60*60 for x in stats.values()))
     if num_tiers[0] > 0:
         dist += '{} supernode{} online with < T1 stake\n'.format(num_tiers[0], 's' if num_tiers[0] != 1 else '')
     dist += '{} supernode{} offline'.format(num_offline, 's' if num_offline != 1 else '')
@@ -524,6 +528,8 @@ def send_stake(bot, update, user_data, args):
         return
     already_sent.add(reply_to.message_id)
 
+    append_usage = "\nUsage: /send {NNN,T1,T2,T3,T4} WALLET [TIER WALLET [...]]"
+    stake_details = []
     if len(args) < 2 or len(args) % 2 != 0:
         bad = 'Wrong number of arguments'
     else:
@@ -539,16 +545,26 @@ def send_stake(bot, update, user_data, args):
                 if amount > amounts['T4']:
                     bad = 'Sorry; {} is too much 💰 to send all at once'.format(tier)
                     break
+                stake_details.append(format_wallet(wallet) + ' 👈 ' + format_balance(amount))
             elif tier.upper() in amounts:
-                amount = amounts[tier.upper()]
+                staked_already = (sum(globaldata[wallet]['funded'].values())
+                        if wallet in globaldata and 'funded' in globaldata[wallet] else 0)
+                amount = amounts[tier.upper()] - staked_already
+                if amount > 0:
+                    stake_details.append(format_wallet(wallet) + ' 👈 ' + format_balance(amount) + (' more' if staked_already else ''))
+                else:
+                    bad = "🔴 I'm sorry, Dave, I'm afraid I can't do that: I already sent " + format_balance(staked_already) + " to " + format_wallet(wallet)
+                    append_usage = ''
+                    break
             else:
                 bad = 'Invalid amount to send: _{}_'.format(tier)
                 break
             dest.append({"amount": amount, "address": wallet})
 
     if bad is not None:
-        send_reply(bot, update, bad + "\nUsage: /send {NNN,T1,T2,T3,T4} WALLET [TIER WALLET [...]]",
+        send_reply(bot, update, bad + append_usage,
                 reply_to=reply_to)
+        return
 
     assert(len(dest) > 0)
 
@@ -576,9 +592,9 @@ def send_stake(bot, update, user_data, args):
                 if 'funded' not in globaldata[addr]:
                     globaldata[addr]['funded'] = {}
                 globaldata[addr]['funded'][tx_hash] = amt
-            send_reply(bot, update, "💸 Stake{} sent in [{}...](https://rta.graft.observer/tx/{})!".format(
+            send_reply(bot, update, "💸 Stake{} sent in [{}...](https://rta.graft.observer/tx/{}):\n{}".format(
                     '' if len(dest) == 1 else 's',
-                    tx_hash[0:8], tx_hash),
+                    tx_hash[0:8], tx_hash, '\n'.join(stake_details)),
                 reply_to=reply_to)
     except Exception as e:
         print("An exception occured while sending:")
