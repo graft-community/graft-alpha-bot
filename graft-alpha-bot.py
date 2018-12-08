@@ -365,9 +365,9 @@ def sn_info(addr):
         sn = globaldata[addr]
         if 'last_seen' not in sn:
             if 'funded' in sn and sn['funded']:
-                return 'I sent {} to that SN _({})_, but I have never seen it online.'.format(
+                return 'I sent {} to that SN ({}), but I have never seen it online.'.format(
                         format_balance(sum(sn['funded'].values())),
-                        ', '.join('[{}](https://rta.graft.observer/tx/{})'.format(x[0:8], x) for x in sn['funded'].keys())
+                        ', '.join('[{}...](https://rta.graft.observer/tx/{})'.format(x[0:8], x) for x in sn['funded'].keys())
                         )
             else:
                 return 'Sorry, I have never seen that supernode. 🙁'
