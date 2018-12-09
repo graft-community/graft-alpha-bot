@@ -4,6 +4,9 @@ import threading
 import time
 import re
 import requests
+import asyncio
+import aiohttp
+import json.decoder
 import html
 import shelve
 from functools import wraps, partial
@@ -19,13 +22,31 @@ TELEGRAM_TOKEN = "FIXME"
 PERSISTENCE_USER_FILENAME = 'rta-user.data'
 
 # file to store persistent global data in
-PERSISTENCE_GLOBAL_FILENAME = 'rta-global.data'
+PERSISTENCE_GLOBAL_SNS_FILENAME = 'rta-global.data'
 
-# URL to a graft supernode.  Should not end in a /
-RTA_URL = 'http://localhost:29016'
+# URL to graft supernodes.  Should not end in a /
+SUPERNODES = [
+        ('Jas1', 'http://localhost:29001'),
+        ('Jas8', 'http://localhost:29008'),
+        ('JasG', 'http://localhost:29016'),
+        ('dev1', 'http://18.214.197.224:28690'),
+        ('dev2', 'http://18.214.197.50:28690'),
+        ('dev3', 'http://35.169.179.171:28690'),
+        ('dev4', 'http://34.192.115.160:28690'),
+]
 
-# URL to a graft node, typically the one the above RTA_URL supernode is connected to
-NODE_URL = 'http://localhost:28681'
+# URL(s) to graft nodes; typically the one the above RTA_URL supernode is connected to.  The first
+# one is used when we need some info (like current height); they all get used for things like the
+# /nodes and /height commands.
+NODES = [
+        ('J0', 'http://localhost:28681'),
+        ('J1', 'http://localhost:55111'),
+        ('J2', 'http://localhost:55001'),
+        ('dev1', 'http://18.214.197.224:28681'),
+        ('dev2', 'http://18.214.197.50:28681'),
+        ('dev3', 'http://35.169.179.171:28681'),
+        ('dev4', 'http://34.192.115.160:28681'),
+]
 
 # Telegram handle of the bot's owner
 OWNER = 'FIXME'
@@ -61,9 +82,9 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 pp = None
-globaldata = None
+globalsns = None
+lastresults = None
 updater = None
-last_stats = None
 
 print = partial(print, flush=True)
 
@@ -76,7 +97,7 @@ def tier(balance):
 
 
 def format_wallet(addr):
-    return '*' + addr[0:8] + '...' + addr[-3:] + '*'
+    return '*' + addr[0:6] + '...' + addr[-3:] + '*'
 
 
 def format_balance(atoms):
@@ -96,6 +117,10 @@ def format_balance(atoms):
     if bal >= 1:
         return "{:.2f}".format(bal)
     return "{:.4f}".format(bal)
+
+
+def format_tier(t):
+    return ('_[t₀]_', '_[t₁]_', '_[t₂]_', '_[t₃]_', '_[t₄]_')[t]
 
 
 def friendly_ago(ago):
@@ -155,8 +180,8 @@ def send_action(action):
 def needs_data(func):
     @wraps(func)
     def wrapped(bot, update, *args, **kwargs):
-        global last_stats
-        if not last_stats:
+        global lastresults
+        if not lastresults:
             send_reply(bot, update, 'I\'m still starting up; try again later')
             return
         return func(bot, update, *args, **kwargs)
@@ -165,24 +190,25 @@ def needs_data(func):
 
 eighths = ' ▏▎▍▌▋▊▉█'
 
-def get_dist(stats = None):
-    global last_stats
-    if stats is None:
-        stats = last_stats
+def get_dist(results = None):
+    global globalsns, lastresults
+    if results is None:
+        results = lastresults
     num_tiers = [0, 0, 0, 0, 0]
     total_balance, total_stakes = 0, 0
-    for x in stats.values():
-        if x['LastUpdateAge'] <= TIMEOUT:
-            t = tier(x['StakeAmount'])
+    now = time.time()
+    for a, g in globalsns.items():
+        if g['last_seen'] and g['last_seen'] >= now - TIMEOUT:
+            t = g['tier']
             num_tiers[t] += 1
-            total_balance += x['StakeAmount']
+            total_balance += g['stake']
             total_stakes += (50 if t == 1 else 90 if t == 2 else 150 if t == 3 else 250 if t == 4 else 0)
     total_stakes *= 10000000000000
 
     num_sns = sum(num_tiers[1:])
     if num_sns == 0:
         return 'I\'m still starting up; try again later'
-    num_offline = len(stats) - num_sns
+    num_offline = len(globalsns) - num_sns
     pct_tiers = [x / num_sns * 100 for x in num_tiers[1:]]
     global eighths
     blocks = []
@@ -196,10 +222,24 @@ def get_dist(stats = None):
     for t in (1, 2, 3, 4):
         dist += ('T{}: ' + blocks[t-1] + " ({} = {:.1f}%)\n").format(t, num_tiers[t], pct_tiers[t-1])
     dist += '{} supernode{} online and staked\n'.format(num_sns, 's' if num_sns != 1 else '')
-    dist += 'Uptimes: _{}_ ≤ 2m, _{}_ ≤ 10m, _{}_ ≤ 1h\n'.format(
-            sum(x['LastUpdateAge'] <= 2*60 for x in stats.values()),
-            sum(2*60 < x['LastUpdateAge'] <= 10*60 for x in stats.values()),
-            sum(10*60 < x['LastUpdateAge'] <= 60*60 for x in stats.values()))
+    now = time.time()
+    dist += 'Uptimes: *{}* ≤ _2m_, *{}* ≤ _10m_, *{}* ≤ _1h_\n'.format(
+            sum(bool(x['last_seen'] and now - x['last_seen'] <= 2*60) for x in globalsns.values()),
+            sum(bool(x['last_seen'] and 2*60 < now - x['last_seen'] <= 10*60) for x in globalsns.values()),
+            sum(bool(x['last_seen'] and 10*60 < now - x['last_seen'] <= 60*60) for x in globalsns.values()))
+    num_queried = sum(bool(x) for x in results.values())
+    online_on = { 'all': 0, 'most': 0, 'some': 0, 'one': 0 }
+    for a in globalsns.keys():
+        count = sum(a in r and r[a]['LastUpdateAge'] < TIMEOUT for r in results.values() if r)
+        if count == 0:
+            continue
+        key =  ('all' if count == num_queried else
+                'most' if count >= 0.5*num_queried else
+                'some' if count > 1 else 'one')
+        online_on[key] += 1
+
+    dist += 'Network:\n_{all}_/_{most}_/_{some}_/_{one}_ SNs online on all/most/some/one queried SNs\n'.format(**online_on)
+
     if num_tiers[0] > 0:
         dist += '{} supernode{} online with < T1 stake\n'.format(num_tiers[0], 's' if num_tiers[0] != 1 else '')
     dist += '{} supernode{} offline'.format(num_offline, 's' if num_offline != 1 else '')
@@ -214,106 +254,126 @@ def show_dist(bot, update, user_data):
     send_reply(bot, update, get_dist())
 
 
+async def get_json_data(urls, timeout=10):
+    results = [None] * len(urls)
+    async with aiohttp.ClientSession(read_timeout=timeout) as session:
+        for i in range(len(urls)):
+            try:
+                async with session.get(urls[i]) as resp:
+                    results[i] = await resp.json()
+            except (json.decoder.JSONDecodeError,
+                    aiohttp.ClientError,
+                    asyncio.TimeoutError) as e:
+                print("Something getting wrong during json data fetching: {}".format(e))
+    return results
+
+
 time_to_die = False
 def rta_updater():
-    global last_stats, time_to_die, updater
+    global lastresults, time_to_die, updater
     last = 0
     first = ANNOUNCE_LIFE
-    #first = True  # uncomment to debug reconnection
     last_summary = time.time()
+
+    loop = asyncio.new_event_loop()
+
     while not time_to_die:
+        if time.time() - last < 60:
+            time.sleep(0.25)
+            continue
+
+        results = loop.run_until_complete(get_json_data([
+            sn[1] + '/debug/supernode_list/1' for sn in SUPERNODES]))
+
+        results = dict(zip(
+            (s[0] for s in SUPERNODES),
+            ({ x['Address']: x for x in r['result']['items'] } if r else None for r in results)
+        ))
+
+        if not any(results.values()):
+            print("Something getting very wrong: all SNs returned nothing!")
+            time.sleep(3)
+            continue
+
         now = time.time()
-        if now - last < 60:
-            time.sleep(0.25)
-            continue
-
-        try:
-            data = requests.get(RTA_URL + '/debug/supernode_list/1', timeout=2).json()
-            stats = { x['Address']: x for x in data['result']['items'] }
-            if len(stats) < 20:
-                raise Exception("Expected many SNs, but found < 20")
-        except Exception as e:
-            print("Something getting wrong during RTA stats fetching: {}".format(e))
-            time.sleep(0.25)
-            continue
-
-        uptime = None
-        # Custom hack to query the uptime of the SN; this returns {"first":1542559794,"now":1542559839}
-        # where `first` is the time when the timehack was first requested and `now` is the current
-        # time.  This gives us a (hacky) way to tell whether the SN has at least the TIMEOUT uptime;
-        # if it doesn't, we don't report timeouts/returns (because they might just be happening
-        # because the SN just restarted and doesn't have a full picture yet).
-        try:
-            timehack = requests.get(RTA_URL + '/debug/timehack', timeout=2).json()
-            uptime = timehack['now'] - timehack['first']
-        except Exception:
-            pass
-
         last = now
 
         # Each of these contain: { 'addr': 'F...', 'age': 123, 'tier': [0-4], 'old_tier': [0-4] }
         # (old_tier is only set if the SN was seen last time and the tier has changed)
-        new_sns = [] 
+        new_addr = set() 
+        new_sns = []
         timeouts = []
         returns = []
-        newtiers = []
+        tier_was = {}
+        went_offline = set()
         came_online_after = {}
+        num_sns = 0
 
         now = time.time()
-        for x in stats.values():
-            seen = None if x['LastUpdateAge'] > 1000000000 else now - x['LastUpdateAge']
-            if x['Address'] not in globaldata:
-                globaldata[x['Address']] = {}
-            g = globaldata[x['Address']]
-            if seen and ('last_seen' not in g or g['last_seen'] is None or seen > g['last_seen']):
-                g['last_seen'] = seen
+        for sn in SUPERNODES:
+            sn_tag = sn[0]
+            stats = results[sn_tag]
+            if not stats:
+                continue
+            num_sns += 1
+
+            for x in stats.values():
+                a = x['Address']
+                seen = None if x['LastUpdateAge'] > 1000000000 else now - x['LastUpdateAge']
+                if a not in globalsns:
+                    globalsns[a] = {}
+                    new_addr.add(a)
+                g = globalsns[a]
+                update_stake = 'stake' not in g
+                if seen and ('last_seen' not in g or g['last_seen'] is None or seen > g['last_seen']):
+                    g['last_seen'] = seen
+                    update_stake = True
+                if update_stake:
+                    t = tier(x['StakeAmount'])
+                    if 'tier' in g and t != g['tier']:
+                        tier_was[a] = g['tier']
+                    g['tier'] = t
+                    g['stake'] = x['StakeAmount']
+
+        for a, g in globalsns.items():
+            for k in ('last_seen', 'tier'):
+                if k not in g:
+                    g[k] = None
             if g['last_seen'] is None or g['last_seen'] < now - TIMEOUT:
                 if 'online_since' in g:
                     del g['online_since']
+                    went_offline.add(a)
                 if 'offline_since' not in g:
                     g['offline_since'] = now if g['last_seen'] is None else g['last_seen'] + TIMEOUT
             else:
                 if 'offline_since' in g:
-                    came_online_after[x['Address']] = now - g['offline_since']
+                    came_online_after[a] = now - g['offline_since']
                     del g['offline_since']
                 if 'online_since' not in g:
                     g['online_since'] = g['last_seen']
 
-            g['tier'] = tier(x['StakeAmount'])
-            g['stake'] = x['StakeAmount']
-
-        if last_stats:
-            for x in stats.values():
-                addr, age, t = x['Address'], x['LastUpdateAge'], tier(x['StakeAmount'])
-                row = { 'addr': addr, 'age': age, 'tier': t }
-                if addr not in last_stats:
-                    if age < TIMEOUT:
-                        new_sns.append(row)
-                    continue
-
-                last_age = last_stats[addr]['LastUpdateAge']
-                last_t = tier(last_stats[addr]['StakeAmount'])
-
-                if t != last_t:
-                    row['old_tier'] = last_t
-                    newtiers.append(row)
-
-                if age > TIMEOUT >= last_age and (uptime is None or uptime > TIMEOUT):
-                    timeouts.append(row)
-                elif age <= TIMEOUT < last_age and (uptime is None or uptime > TIMEOUT):
-                    returns.append(row)
-        else:
-            last_stats = stats
+            seen, t = g['last_seen'], g['tier']
+            seen_by = [x[0] for x in SUPERNODES if x[0] in results and results[x[0]] and a in results[x[0]]]
+            age = None if seen is None else now - seen
+            row = { 'addr': a, 'age': age, 'tier': t, 'seen_by': seen_by }
+            if a in new_addr:
+                if age is not None and age < TIMEOUT:
+                    new_sns.append(row)
+                continue
+            elif a in came_online_after:
+                returns.append(row)
+            elif a in went_offline:
+                timeouts.append(row)
 
         updates = []
         if first:
             updates.append("I'm alive! 🍚 🍅 🍏")
         for x in new_sns:
             updates.append("💖 New *T{}* supernode appeared: {}".format(x['tier'], format_wallet(x['addr'])))
-        for x in newtiers:
-            if x['tier'] > x['old_tier']:
+        for a, old_tier in tier_was.items():
+            if globalsns[a]['tier'] > old_tier:
                 updates.append("💰 {} upgraded from *T{}* to *T{}*".format(format_wallet(x['addr']), x['old_tier'], x['tier']))
-            else:
+            elif globalsns[a]['tier'] < old_tier:
                 updates.append("😢 {} downgraded from *T{}* to *T{}*".format(format_wallet(x['addr']), x['old_tier'], x['tier']))
         for x in returns:
             updates.append("💓 {} is back online _(after {})_!".format(
@@ -323,17 +383,17 @@ def rta_updater():
             updates.append("💔 {} is offline!".format(format_wallet(x['addr'])))
 
         if now - last_summary >= SUMMARY_FREQUENCY:
-            updates.append(get_dist(stats))
+            updates.append(get_dist(results))
             last_summary = now
 
         if updates:
             try:
                 updater.bot.send_message(SEND_TO, '\n'.join(updates), parse_mode=ParseMode.MARKDOWN)
+                first = False
             except Exception as e:
                 print("An exception occured during updating/notifications: {}".format(e))
                 continue
-            last_stats = stats
-            first = False
+        lastresults = results
 
 
 def start(bot, update, user_data):
@@ -350,6 +410,12 @@ ADDR — queries the status of the given SN from the point of view of the bot's 
 
 /sample — shows the auth sample for the current or a requested block.
 
+/nodes — shows the status of the graft nodes this bot talks to.
+
+/snodes — shows the status of the graft supernodes this bot talks to.
+
+/height — shows the current height (or heights) on the nodes this bot talks to.
+
 /balance — shows the balance of the bot's wallet for sending out test stakes.
 
 /donate — shows the bot's address (to help replenish the bot's available funds).
@@ -363,11 +429,12 @@ ADDR — queries the status of the given SN from the point of view of the bot's 
 
 
 def sn_info(addr):
-    if addr not in globaldata:
+    global globalsns, lastresults
+    if addr not in globalsns:
         return 'Sorry, I have never seen that supernode. 🙁'
     else:
-        sn = globaldata[addr]
-        if 'last_seen' not in sn:
+        sn = globalsns[addr]
+        if not sn['last_seen']:
             if 'funded' in sn and sn['funded']:
                 return 'I sent {} to that SN ({}), but I have never seen it online.'.format(
                         format_balance(sum(sn['funded'].values())),
@@ -379,10 +446,21 @@ def sn_info(addr):
         msgs = []
         msgs.append("*Tier:* {} (_{}.{:010d} GRFT_)".format(sn['tier'], sn['stake'] // 10000000000, sn['stake'] % 10000000000))
         msgs.append("*Last announce:* {} ago".format(friendly_ago(now - sn['last_seen'])))
-        if 'online_since' in sn:
-            msgs.append("*Status:* 💓 online _({})_".format(friendly_ago(now - sn['online_since'])))
-        else:
-            msgs.append("*Status:* 💔 offline _({})_".format(friendly_ago(now - sn['offline_since'])))
+        online_for = [sn for sn, r in lastresults.items() if r and addr in r and r[addr]['LastUpdateAge'] <= TIMEOUT]
+        offline_for = [sn for sn, r in lastresults.items() if r and (addr not in r or r[addr]['LastUpdateAge'] > TIMEOUT)]
+        mixed = online_for and offline_for
+        if 'online_since' in sn or mixed:
+            msgs.append("*Status:* 💓 online")
+            if 'online_since' in sn:
+                msgs[-1] += " _({})_".format(friendly_ago(now - sn['online_since']))
+            if mixed:
+                msgs[-1] += ' — ('+', '.join('_'+x+'_' for x in online_for)+')'
+        if 'offline_since' in sn or mixed:
+            msgs.append("*Status:* 💔 offline")
+            if 'offline_since' in sn:
+                msgs[-1] += " _({})_".format(friendly_ago(now - sn['offline_since']))
+            if mixed:
+                msgs[-1] += ' — ('+', '.join('_'+x+'_' for x in offline_for)+')'
         if 'funded' in sn:
             msgs.append("*Funding:* {} ({})".format(
                 format_balance(sum(sn['funded'].values())),
@@ -396,7 +474,7 @@ RE_ADDR_PATTERN = r'(F[3-9A-D][1-9a-km-zA-HJ-NP-Z]{3,})\.\.\.([1-9a-km-zA-HJ-NP-
 
 @needs_data
 def show_sn(bot, update, user_data, args):
-    global last_stats
+    global globalsns
     addrs = []
     replies = []
     for a in args:
@@ -408,7 +486,7 @@ def show_sn(bot, update, user_data, args):
         if m:
             prefix, suffix = m.group(1), m.group(2)
             found = False
-            for x in last_stats.keys():
+            for x in globalsns.keys():
                 if x.startswith(prefix) and x.endswith(suffix):
                     found = True
                     send_reply(bot, update, sn_info(x))
@@ -419,21 +497,39 @@ def show_sn(bot, update, user_data, args):
             send_reply(bot, update, 'That doesn\'t look like a valid testnet address')
 
 
+def filter_nodes(args, select_from=NODES, empty_means_all=True):
+    if not args and empty_means_all:
+        return (select_from, [])
+    ns, leftover = [], []
+    for want_n in args:
+        found = False
+        for n in select_from:
+            if want_n == n[0]:
+                ns.append(n)
+                found = True
+                break
+        if not found:
+            leftover.append(want_n)
+
+    return (ns, leftover)
+
+
 @needs_data
-@send_action(ChatAction.FIND_LOCATION)
+@send_action(ChatAction.UPLOAD_DOCUMENT)
 def show_sample(bot, update, user_data, args):
     height, relative = None, False
-    if args:
-        if len(args) == 1 and re.match(r'^[+-]?\d+$', args[0]):
-            relative = args[0][0] in ('+', '-')
-            height = int(args[0])
-        else:
-            send_reply(bot, update, "❌ Bad arguments!\nUsage: /sample [HEIGHT|+N|-N] "
-                    "— shows auth sample for the current height, the given height, or current height ±N")
-            return
+    if len(args) >= 1 and re.match(r'^[+-]?\d+$', args[0]):
+        relative = args[0][0] in ('+', '-')
+        height = int(args[0])
+        args = args[1:]
+    sns, leftover = filter_nodes(args, select_from=SUPERNODES)
+    if leftover:
+        send_reply(bot, update, "❌ Bad arguments!\nUsage: /sample [HEIGHT|+N|-N] [SN ...]"
+                "— shows auth sample for the current height, the given height, or current height ±N")
+        return
 
     try:
-        curr_height = requests.get(NODE_URL + '/getheight').json()['height']
+        curr_height = requests.get(NODES[0][1] + '/getheight').json()['height']
     except Exception as e:
         send_reply(bot, update, "⚠ *Something getting wrong* while getting current height 💩")
         raise e
@@ -450,25 +546,139 @@ def show_sample(bot, update, user_data, args):
         send_reply(bot, update, "🔮 Error: crystal ball malfunctioned; can't look up more than 19 blocks into the future")
         return
 
-    try:
-        sample = requests.get(RTA_URL + '/debug/auth_sample/{}'.format(height), timeout=2).json()['result']['items']
-    except Exception as e:
-        send_reply(bot, update, "⚠ *Something getting wrong* while getting auth sample 🤢")
-        raise e
+    loop = asyncio.new_event_loop()
+    results = loop.run_until_complete(get_json_data([
+        sn[1] + '/debug/auth_sample/{}'.format(height) for sn in sns], timeout=2))
+    samples = {}
+    for sn, r in zip(sns, results):
+        if not r:
+            continue
+        sample = ' '.join(
+                "{}{}".format(format_wallet(sn['Address']), format_tier(tier(sn['StakeAmount']))) for sn in r['result']['items'])
+        if sample not in samples:
+            samples[sample] = []
+        samples[sample].append(sn[0])
 
-    if not sample:
-        msg = "😧 *Something getting wrong*: auth sample for height {} return an empty list!".format(height)
+    msg = None
+    if not samples:
+        msg = "⚠ *Something getting wrong* while getting auth samples 💩"
+    elif len(samples) > 1:
+        msg = '\n'.join(s+' — ('+', '.join('_'+x+'_' for x in h)+')' for s, h in samples.items())
     else:
-        msg = "Auth sample for height {}:".format(height)
-        for sn in sample:
-            msg += " {} _(T{})_".format(format_wallet(sn['Address']), tier(sn['StakeAmount']))
+        msg = next(iter(samples.keys()))
+
+    send_reply(bot, update, 'Auth sample for height _{}_:\n'.format(height) + msg)
+
+
+@send_action(ChatAction.UPLOAD_DOCUMENT)
+def show_height(bot, update, user_data, args):
+    ns, leftover = filter_nodes(args)
+    if leftover:
+        send_reply(bot, update, "❌ {} isn't a node I know about".format(leftover[0]))
+        return
+
+    heights = {}
+    loop = asyncio.new_event_loop()
+    results = loop.run_until_complete(get_json_data([
+        n[1] + '/getheight' for n in ns], timeout=2))
+    for n, r in zip(ns, results):
+        if not r:
+            continue
+        h = r['height']
+        if h not in heights:
+            heights[h] = []
+        heights[h].append(n[0])
+
+    msg = None
+    if not heights:
+        msg = "⚠ *Something getting wrong* while getting current height 💩"
+    elif len(heights) > 1:
+        msg = "Current heights:" + ''.join(
+                "\n*{}* ({})".format(h, ', '.join("_"+x+"_" for x in heights[h]))
+                for h in sorted(heights.keys()))
+    else:
+        msg = "Current height: *{}*".format(next(iter(heights.keys())))
 
     send_reply(bot, update, msg)
 
 
+@send_action(ChatAction.UPLOAD_DOCUMENT)
+def show_nodes(bot, update, user_data, args):
+    ns, leftover = filter_nodes(args)
+    if leftover:
+        send_reply(bot, update, "❌ {} isn't a node I know about".format(leftover[0]))
+        return
+
+    heights = {}
+    loop = asyncio.new_event_loop()
+    results = loop.run_until_complete(get_json_data([
+        n[1] + '/getinfo' for n in ns], timeout=2))
+    status = []
+    for n, r in zip(ns, results):
+        st = None
+        if not r:
+            st = "*{}*: Connection failed 💣".format(n[0])
+        else:
+            st = "*{}*: H:*{}*; *{}*_(out)_+*{}*_(in)_; up *{}*".format(
+                    n[0],
+                    r['height'], r['outgoing_connections_count'], r['incoming_connections_count'],
+                    friendly_ago(time.time() - r['start_time']))
+        status.append(st)
+
+    send_reply(bot, update, '\n'.join(status))
+
+
+@needs_data
+def show_snodes(bot, update, user_data, args):
+    global lastresults
+    sns, leftover = filter_nodes(args, select_from=SUPERNODES)
+    if leftover:
+        send_reply(bot, update, "❌ {} isn't a supernode I know about".format(leftover[0]))
+        return
+
+    stats = []
+    for sn in sns:
+        st = '*{}*: '.format(sn[0])
+        r = lastresults[sn[0]]
+        if not r:
+            st += '_connection failed_'
+            continue
+        count = { x: 0 for x in ('2m', '10m', '1h', 'online', 'offline', 'never') }
+        for t in range(5):
+            count['t{}'.format(t)] = 0
+
+        for x in r.values():
+            if x['LastUpdateAge'] <= TIMEOUT:
+                count['online'] += 1
+                count['t{}'.format(tier(x['StakeAmount']))] += 1
+                if x['LastUpdateAge'] <= 120:
+                    count['2m'] += 1
+                elif x['LastUpdateAge'] <= 600:
+                    count['10m'] += 1
+                else:
+                    count['1h'] += 1
+            elif x['LastUpdateAge'] <= 1000000000:
+                count['offline'] += 1
+            else:
+                count['never'] += 1
+
+        st += '*{online}* 💓, *{offline}* 💔, *{never}* 🛑'.format(**count)
+        if count['online'] > 0:
+            st += '  _({2m}/{10m}/{1h})_  *[{t1}-{t2}-{t3}-{t4}]*'.format(**count)
+
+        stats.append(st)
+
+    stats.append("Legend: 💓=online; 💔=expired; 🛑=offline; _(a/b/c)_=2m/10m/1h uptime counts; *[w-x-y-z]*={}-…-{} counts".format(
+        format_tier(1), format_tier(4)))
+
+    send_reply(bot, update, '\n'.join(stats))
+
+
+
+
 @needs_data
 def msg_input(bot, update, user_data):
-    global last_stats
+    global globalsns
 
     public_chat = update.message.chat.type != 'private'
     if re.fullmatch(RE_ADDR, update.message.text):
@@ -479,7 +689,7 @@ def msg_input(bot, update, user_data):
     m = re.fullmatch(RE_ADDR_PATTERN, update.message.text)
     if m:
         prefix, suffix = m.group(1), m.group(2)
-        for x in last_stats.keys():
+        for x in globalsns.keys():
             if x.startswith(prefix) and x.endswith(suffix):
                 addrs.append(x)
 
@@ -492,10 +702,8 @@ def msg_input(bot, update, user_data):
         return
 
     if len(addrs) == 1:
-        print("info: {}".format(sn_info(addrs[0])))
         send_reply(bot, update, sn_info(addrs[0]))
     else:
-        print("info: {}".format(addrs))
         send_reply(bot, update, '\n\n'.join('{}:\n{}'.format(format_wallet(x), sn_info(x)) for x in addrs))
 
 
@@ -504,7 +712,6 @@ already_sent = set()
 @restricted
 @send_action(ChatAction.TYPING)
 def send_stake(bot, update, user_data, args):
-    global last_stats
 
     bad = None
     dest = []
@@ -547,8 +754,8 @@ def send_stake(bot, update, user_data, args):
                     break
                 stake_details.append(format_wallet(wallet) + ' 👈 ' + format_balance(amount))
             elif tier.upper() in amounts:
-                staked_already = (sum(globaldata[wallet]['funded'].values())
-                        if wallet in globaldata and 'funded' in globaldata[wallet] else 0)
+                staked_already = (sum(globalsns[wallet]['funded'].values())
+                        if wallet in globalsns and 'funded' in globalsns[wallet] else 0)
                 amount = amounts[tier.upper()] - staked_already
                 if amount > 0:
                     stake_details.append(format_wallet(wallet) + ' 👈 ' + format_balance(amount) + (' more' if staked_already else ''))
@@ -587,11 +794,11 @@ def send_stake(bot, update, user_data, args):
             for x in dest:
                 addr, amt = x['address'], x['amount']
                 print('\n    {} -- {}'.format(addr, amt))
-                if addr not in globaldata:
-                    globaldata[addr] = {}
-                if 'funded' not in globaldata[addr]:
-                    globaldata[addr]['funded'] = {}
-                globaldata[addr]['funded'][tx_hash] = amt
+                if addr not in globalsns:
+                    globalsns[addr] = {}
+                if 'funded' not in globalsns[addr]:
+                    globalsns[addr]['funded'] = {}
+                globalsns[addr]['funded'][tx_hash] = amt
             send_reply(bot, update, "💸 Stake{} sent in [{}...](https://rta.graft.observer/tx/{}):\n{}".format(
                     '' if len(dest) == 1 else 's',
                     tx_hash[0:8], tx_hash, '\n'.join(stake_details)),
@@ -635,14 +842,15 @@ def donate(bot, update, user_data):
 
 rta_thread = None
 def start_rta_update_thread():
-    global rta_thread, last_stats
+    global rta_thread, lastresults
     rta_thread = threading.Thread(target=rta_updater)
     rta_thread.start()
     while True:
-        if last_stats:
+        if lastresults and any(lastresults):
             print("Initial RTA stats fetched")
             return
-        time.sleep(0.25)
+        print("Waiting for initial RTA stats")
+        time.sleep(0.5)
 
 
 def stop_rta_thread(signum, frame):
@@ -658,9 +866,9 @@ def error(bot, update, error):
 
 def main():
     print("Starting bot")
-    global pp, updater, globaldata
+    global pp, updater, globalsns
 
-    globaldata = shelve.open(PERSISTENCE_GLOBAL_FILENAME, writeback=True)
+    globalsns = shelve.open(PERSISTENCE_GLOBAL_SNS_FILENAME, writeback=True)
 
     # Create the Updater and pass it your bot's token.
     pp = PicklePersistence(filename=PERSISTENCE_USER_FILENAME, store_user_data=True, store_chat_data=False, on_flush=True)
@@ -679,6 +887,9 @@ def main():
     updater.dispatcher.add_handler(CommandHandler('donate', donate, pass_user_data=True))
     updater.dispatcher.add_handler(CommandHandler('sn', show_sn, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(CommandHandler('sample', show_sample, pass_user_data=True, pass_args=True))
+    updater.dispatcher.add_handler(CommandHandler('height', show_height, pass_user_data=True, pass_args=True))
+    updater.dispatcher.add_handler(CommandHandler('nodes', show_nodes, pass_user_data=True, pass_args=True))
+    updater.dispatcher.add_handler(CommandHandler('snodes', show_snodes, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(MessageHandler(Filters.text, msg_input, pass_user_data=True))
 
     # log all errors
@@ -696,7 +907,7 @@ def main():
 
     print("Saving persistence and shutting down")
     pp.flush()
-    globaldata.close()
+    globalsns.close()
 
 
 if __name__ == '__main__':
