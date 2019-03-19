@@ -96,8 +96,12 @@ def tier(balance):
             4)
 
 
-def format_wallet(addr):
-    return '*' + addr[0:6] + '...' + addr[-3:] + '*'
+def format_wallet(addr, markup='*', init_len=6):
+    return markup + addr[0:init_len] + '...' + addr[-3:] + markup
+
+
+def format_pubkey(pub, init_len=6):
+    return '*' + pub[0:init_len] + '...' + pub[-3:] + '*'
 
 
 def format_balance(atoms):
@@ -148,19 +152,6 @@ def send_reply(bot, update, message, reply_to=None, reply_markup=None, parse_mod
             chat_id=update.callback_query.message.chat_id,
             text=message, parse_mode=parse_mode,
             reply_markup=reply_markup)
-
-
-def restricted(func):
-    @wraps(func)
-    def wrapped(bot, update, *args, **kwargs):
-        user_id = update.effective_user.id
-        if user_id not in BOSS_USERS:
-            print("Unauthorized access denied for {}.".format(user_id))
-            send_reply(bot, update, "I'm sorry, Dave.  I'm afraid I can't do that. (You aren't authorized to send funds! — " +
-                    " ".join(BOSS_USERS.values()) + " 👆)");
-            return
-        return func(bot, update, *args, **kwargs)
-    return wrapped
 
 
 def send_action(action):
@@ -223,10 +214,12 @@ def get_dist(results = None):
         dist += ('T{}: ' + blocks[t-1] + " ({} = {:.1f}%)\n").format(t, num_tiers[t], pct_tiers[t-1])
     dist += '{} supernode{} online and staked\n'.format(num_sns, 's' if num_sns != 1 else '')
     now = time.time()
-    dist += 'Uptimes: *{}* ≤ _2m_, *{}* ≤ _10m_, *{}* ≤ _1h_\n'.format(
+    dist += 'Uptimes: *{}* ≤ _2m_, *{}* ≤ _10m_, *{}* ≤ _30m_, *{}* ≤ _1h_\n'.format(
             sum(bool(x['last_seen'] and now - x['last_seen'] <= 2*60) for x in globalsns.values()),
             sum(bool(x['last_seen'] and 2*60 < now - x['last_seen'] <= 10*60) for x in globalsns.values()),
-            sum(bool(x['last_seen'] and 10*60 < now - x['last_seen'] <= 60*60) for x in globalsns.values()))
+            sum(bool(x['last_seen'] and 10*60 < now - x['last_seen'] <= 30*60) for x in globalsns.values()),
+            sum(bool(x['last_seen'] and 30*60 < now - x['last_seen'] <= 60*60) for x in globalsns.values()),
+            )
     num_queried = sum(bool(x) for x in results.values())
     online_on = { 'all': 0, 'most': 0, 'some': 0, 'one': 0 }
     for a in globalsns.keys():
@@ -252,6 +245,8 @@ def get_dist(results = None):
 @needs_data
 def show_dist(bot, update, user_data):
     send_reply(bot, update, get_dist())
+    if update.message.chat.type != 'private':
+        last_summary = time.time()
 
 
 async def get_json_data(urls, timeout=10):
@@ -261,10 +256,12 @@ async def get_json_data(urls, timeout=10):
             try:
                 async with session.get(urls[i]) as resp:
                     results[i] = await resp.json()
-            except (json.decoder.JSONDecodeError,
-                    aiohttp.ClientError,
-                    asyncio.TimeoutError) as e:
-                print("Something getting wrong during json data fetching: {}".format(e))
+            except json.decoder.JSONDecodeError as a:
+                print("Something getting wrong with JS during json data fetching: {}".format(e))
+            except aiohttp.ClientError as e:
+                print("Something getting wrong with client during json data fetching: {}".format(e))
+            except asyncio.TimeoutError as e:
+                print("Timeout during json data fetching: {}".format(e))
     return results
 
 
@@ -287,7 +284,7 @@ def rta_updater():
 
         results = dict(zip(
             (s[0] for s in SUPERNODES),
-            ({ x['Address']: x for x in r['result']['items'] } if r else None for r in results)
+            ({ x['PublicId']: x for x in r['result']['items'] } if r else None for r in results)
         ))
 
         if not any(results.values()):
@@ -300,87 +297,106 @@ def rta_updater():
 
         # Each of these contain: { 'addr': 'F...', 'age': 123, 'tier': [0-4], 'old_tier': [0-4] }
         # (old_tier is only set if the SN was seen last time and the tier has changed)
-        new_addr = set() 
+        new_pub = set() 
         new_sns = []
         timeouts = []
         returns = []
         tier_was = {}
         went_offline = set()
         came_online_after = {}
-        num_sns = 0
 
-        now = time.time()
         for sn in SUPERNODES:
-            sn_tag = sn[0]
-            stats = results[sn_tag]
+            stats = results[sn[0]]
             if not stats:
                 continue
-            num_sns += 1
+            for p in stats.keys():
+                if p not in globalsns:
+                    globalsns[p] = {}
+                    new_pub.add(p)
 
-            for x in stats.values():
-                a = x['Address']
-                seen = None if x['LastUpdateAge'] > 1000000000 else now - x['LastUpdateAge']
-                if a not in globalsns:
-                    globalsns[a] = {}
-                    new_addr.add(a)
-                g = globalsns[a]
-                update_stake = 'stake' not in g
-                if seen and ('last_seen' not in g or g['last_seen'] is None or seen > g['last_seen']):
-                    g['last_seen'] = seen
-                    update_stake = True
-                if update_stake:
-                    t = tier(x['StakeAmount'])
-                    if 'tier' in g and t != g['tier']:
-                        tier_was[a] = g['tier']
-                    g['tier'] = t
-                    g['stake'] = x['StakeAmount']
-
-        for a, g in globalsns.items():
+        for p, g in globalsns.items():
             for k in ('last_seen', 'tier'):
                 if k not in g:
                     g[k] = None
+
+            best_age = None
+            biggest_stake = None
+            wallet = None
+            for sn in SUPERNODES:
+                sn_tag = sn[0]
+                stats = results[sn_tag]
+                if not stats or p not in stats:
+                    continue
+                age = stats[p]['LastUpdateAge']
+                if best_age is None or age < best_age:
+                    best_age = age
+                stake = stats[p]['StakeAmount']
+                if biggest_stake is None or stake > biggest_stake:
+                    biggest_stake = stake
+                    wallet = stats[p]['Address']
+            seen = None if best_age is None or best_age > 1000000000 else now - best_age
+            if seen and (g['last_seen'] is None or seen > g['last_seen']):
+                g['last_seen'] = seen
+            if biggest_stake is not None:
+                g['stake'] = biggest_stake
+                t = tier(biggest_stake)
+                if g['tier'] != t and g['tier'] is not None:
+                    tier_was[p] = g['tier']
+                g['tier'] = tier(biggest_stake)
+                g['wallet'] = wallet
+
             if g['last_seen'] is None or g['last_seen'] < now - TIMEOUT:
                 if 'online_since' in g:
                     del g['online_since']
-                    went_offline.add(a)
+                    went_offline.add(p)
                 if 'offline_since' not in g:
                     g['offline_since'] = now if g['last_seen'] is None else g['last_seen'] + TIMEOUT
             else:
                 if 'offline_since' in g:
-                    came_online_after[a] = now - g['offline_since']
+                    came_online_after[p] = now - g['offline_since']
                     del g['offline_since']
                 if 'online_since' not in g:
                     g['online_since'] = g['last_seen']
 
             seen, t = g['last_seen'], g['tier']
-            seen_by = [x[0] for x in SUPERNODES if x[0] in results and results[x[0]] and a in results[x[0]]]
+            seen_by = [x[0] for x in SUPERNODES if x[0] in results and results[x[0]] and p in results[x[0]]]
             age = None if seen is None else now - seen
-            row = { 'addr': a, 'age': age, 'tier': t, 'seen_by': seen_by }
-            if a in new_addr:
+            row = { 'pubkey': p, 'wallet': wallet, 'age': age, 'tier': t, 'seen_by': seen_by }
+            if p in new_pub:
                 if age is not None and age < TIMEOUT:
                     new_sns.append(row)
                 continue
-            elif a in came_online_after:
+            elif p in came_online_after:
                 returns.append(row)
-            elif a in went_offline:
+            elif p in went_offline:
                 timeouts.append(row)
 
         updates = []
         if first:
             updates.append("I'm alive! 🍚 🍅 🍏")
         for x in new_sns:
-            updates.append("💖 New *T{}* supernode appeared: {}".format(x['tier'], format_wallet(x['addr'])))
-        for a, old_tier in tier_was.items():
-            if globalsns[a]['tier'] > old_tier:
-                updates.append("💰 {} upgraded from *T{}* to *T{}*".format(format_wallet(x['addr']), x['old_tier'], x['tier']))
-            elif globalsns[a]['tier'] < old_tier:
-                updates.append("😢 {} downgraded from *T{}* to *T{}*".format(format_wallet(x['addr']), x['old_tier'], x['tier']))
+            if x['tier'] > 0:
+                updates.append("💖 New *T{}* supernode appeared: {}".format(x['tier'], format_pubkey(x['pubkey'])))
+            else:
+                updates.append("💗 New unstaked supernode appeared: {}".format(format_pubkey(x['pubkey'])))
+        for p, old_tier in tier_was.items():
+            new_tier = globalsns[p]['tier']
+            if new_tier > old_tier:
+                if old_tier == 0:
+                    updates.append("💖 {} activated as a *T{}*".format(format_pubkey(p), new_tier))
+                else:
+                    updates.append("💰 {} upgraded from *T{}* to *T{}*".format(format_pubkey(p), old_tier, new_tier))
+            elif new_tier < old_tier:
+                if new_tier == 0:
+                    updates.append("📅 {} expired (was a *T{}*)".format(format_pubkey(p), old_tier))
+                else:
+                    updates.append("😢 {} downgraded from *T{}* to *T{}*".format(format_pubkey(p), old_tier, new_tier))
         for x in returns:
             updates.append("💓 {} is back online _(after {})_!".format(
-                format_wallet(x['addr']),
-                'unknown' if x['addr'] not in came_online_after else friendly_ago(came_online_after[x['addr']])))
+                format_pubkey(x['pubkey']),
+                'unknown' if x['pubkey'] not in came_online_after else friendly_ago(came_online_after[x['pubkey']])))
         for x in timeouts:
-            updates.append("💔 {} is offline!".format(format_wallet(x['addr'])))
+            updates.append("💔 {} is offline!".format(format_pubkey(x['pubkey'])))
 
         if now - last_summary >= SUMMARY_FREQUENCY:
             updates.append(get_dist(results))
@@ -402,13 +418,11 @@ def start(bot, update, user_data):
     reply_text += '''
 Supported commands:
 
-ADDR — queries the status of the given SN from the point of view of the bot's local SN.  The address should be specified by itself in a direct message or in a direct reply to bot in the group.  The address can also be specified in a shortened form such as {}
-
-/sn ADDR — same as the above, but the bot responds in the group (without needing to use a direct reply).
+/sn {PUBKEY|WALLET} — queries the status of the given SN, identified by public key *or* wallet address, from a few different supernodes on the network.  The key (or wallet) can also be specified in a shortened form such as *01abcdef...*
 
 /dist — shows the current active SN distribution across tiers.
 
-/sample — shows the auth sample for the current or a requested block.
+/sample — generates a random payment id and shows the auth sample for it.
 
 /nodes — shows the status of the graft nodes this bot talks to.
 
@@ -423,31 +437,64 @@ ADDR — queries the status of the given SN from the point of view of the bot's 
 /send T1 WALLET — requests that the bot sends a stake.  If you aren't an authorized user this tags authorized users to send the stake.  For authorized users, this sends the stake.  Multiple stakes can be send at once using `/send T1 WALLET1 T2 WALLET1`.  Specific amounts can be sent using an amount instead of a `T1` tier.
 
 /send — can be used by an authorized user in reply to a previously denied `/send ...` command to instruct the bot to go ahead with the stake request.
-'''.format(format_wallet("F8JasZ9gHUSV8ir1pVpv5UB1o1xpcCF5RRpViDTbXVAwACQwXGQXL9EFbhQyv2mRpzEopBNf28kV3NWriLJGBzvJ4RR3L5Q"))
+'''
 
     send_reply(bot, update, reply_text)
 
 
-def sn_info(addr):
+def sn_value(pub, *, key=None, get=None, value_fmt="_{}_", none="_(none)_", join='; ', sn_format=" (_{}_)"):
+    """
+    Return '_x_' if all supernodes agree on the value, otherwise something like: '_x_ (_sn1_); _y_ (_sn2, sn3_)'
+
+    Required args:
+    pub - the supernode public id
+    One of get or key:
+        get - a lambda to extract the value from the sn dict inside lastresults
+        key - a key for simple value extraction from the lastresults
+    """
+    if (not key and not get) or (key and get):
+        raise RuntimeError('sn_value must be called with one and only one of get/key')
+    if key:
+        get = lambda r: r[key] if key in r else None
+
+    global lastresults
+    results = {}
+    for sn in SUPERNODES:
+        r = lastresults[sn[0]]
+        if not r:
+            continue
+        value = get(r[pub]) if pub in r else None
+        if value not in results:
+            results[value] = []
+        results[value].append(sn[0])
+
+    if len(results) == 1:
+        return value_fmt.format(next(iter(results)))
+    return join.join((none if k is None else value_fmt.format(k)) + sn_format.format(', '.join(v)) for k, v in results.items())
+
+
+def sn_info(pub):
     global globalsns, lastresults
-    if addr not in globalsns:
+    if pub not in globalsns:
         return 'Sorry, I have never seen that supernode. 🙁'
     else:
-        sn = globalsns[addr]
+        sn = globalsns[pub]
         if not sn['last_seen']:
-            if 'funded' in sn and sn['funded']:
-                return 'I sent {} to that SN ({}), but I have never seen it online.'.format(
-                        format_balance(sum(sn['funded'].values())),
-                        ', '.join('[{}...](https://rta.graft.observer/tx/{})'.format(x[0:8], x) for x in sn['funded'].keys())
-                        )
-            else:
-                return 'Sorry, I have never seen that supernode. 🙁'
+            return 'Sorry, I have never seen that supernode. 🙁'
         now = time.time()
         msgs = []
-        msgs.append("*Tier:* {} (_{}.{:010d} GRFT_)".format(sn['tier'], sn['stake'] // 10000000000, sn['stake'] % 10000000000))
+        msgs.append('*Tier:* ' + sn_value(pub, value_fmt='{}',
+            get=lambda r: tier(r['StakeAmount']) if 'StakeAmount' in r else None))
+        msgs.append('*Stake:* ' + sn_value(pub, join='\n*Stake:* ', value_fmt='{}',
+            get=lambda r: '{:.10f} _GRFT_'.format(r['StakeAmount'] * 1e-10).rstrip('0').rstrip('.') if 'StakeAmount' in r else None))
+        msgs.append('*Stake expiry:* Block ' + sn_value(pub,
+            get=lambda r: r['ExpiringBlock'] if 'ExpiringBlock' in r else None))
+        msgs.append('*Wallet:* ' + sn_value(pub, join='\n*Wallet:* ',
+            get=lambda r: format_wallet(r['Address'], init_len=15, markup='') if 'Address' in r else None))
+
         msgs.append("*Last announce:* {} ago".format(friendly_ago(now - sn['last_seen'])))
-        online_for = [sn for sn, r in lastresults.items() if r and addr in r and r[addr]['LastUpdateAge'] <= TIMEOUT]
-        offline_for = [sn for sn, r in lastresults.items() if r and (addr not in r or r[addr]['LastUpdateAge'] > TIMEOUT)]
+        online_for = [sn for sn, r in lastresults.items() if r and pub in r and r[pub]['LastUpdateAge'] <= TIMEOUT]
+        offline_for = [sn for sn, r in lastresults.items() if r and (pub not in r or r[pub]['LastUpdateAge'] > TIMEOUT)]
         mixed = online_for and offline_for
         if 'online_since' in sn or mixed:
             msgs.append("*Status:* 💓 online")
@@ -461,40 +508,54 @@ def sn_info(addr):
                 msgs[-1] += " _({})_".format(friendly_ago(now - sn['offline_since']))
             if mixed:
                 msgs[-1] += ' — ('+', '.join('_'+x+'_' for x in offline_for)+')'
-        if 'funded' in sn:
-            msgs.append("*Funding:* {} ({})".format(
-                format_balance(sum(sn['funded'].values())),
-                ', '.join('[{}](https://rta.graft.observer/tx/{})'.format(x[0:8], x) for x in sn['funded'].keys())
-            ))
         return '\n'.join(msgs)
 
 RE_ADDR = r'F[3-9A-D][1-9a-km-zA-HJ-NP-Z]{93}'
-RE_ADDR_PATTERN = r'(F[3-9A-D][1-9a-km-zA-HJ-NP-Z]{3,})\.\.\.([1-9a-km-zA-HJ-NP-Z]{0,})'
+RE_ADDR_PATTERN = r'(F[3-9A-D][1-9a-km-zA-HJ-NP-Z]{3,93})(?:\.+([1-9a-km-zA-HJ-NP-Z]{0,90}))?'
 
+RE_PUB = r'[0-9a-f]{64}'
+RE_PUB_PATTERN = r'([0-9a-f]{5,64})(?:\.+([0-9a-f]{0,59}))?'
 
 @needs_data
 def show_sn(bot, update, user_data, args):
     global globalsns
-    addrs = []
     replies = []
     for a in args:
-        if re.fullmatch(RE_ADDR , a):
-            send_reply(bot, update, sn_info(a))
-            continue
-
-        m = re.fullmatch(RE_ADDR_PATTERN, a)
+        found = []
+        m = re.fullmatch(RE_PUB_PATTERN, a)
         if m:
             prefix, suffix = m.group(1), m.group(2)
-            found = False
             for x in globalsns.keys():
-                if x.startswith(prefix) and x.endswith(suffix):
-                    found = True
-                    send_reply(bot, update, sn_info(x))
-
-            if not found:
-                send_reply(bot, update, 'Sorry, but I don\'t know of any SNs like *{}*! 🙁'.format(a))
+                if x.startswith(prefix) and (suffix is None or x.endswith(suffix)):
+                    found.append(x)
         else:
-            send_reply(bot, update, 'That doesn\'t look like a valid testnet address')
+            m = re.fullmatch(RE_ADDR_PATTERN, a)
+            if m:
+                prefix, suffix = m.group(1), m.group(2)
+                for pub, x in globalsns.items():
+                    print(x)
+                    if 'wallet' not in x:
+                        continue
+                    addr = x['wallet']
+                    if addr.startswith(prefix) and (suffix is None or addr.endswith(suffix)):
+                        found.append(pub)
+            else:
+                replies.append('*{}* doesn\'t look like a valid SN id or testnet wallet address'.format(a))
+                continue
+
+        if not found:
+            replies.append('Sorry, but I don\'t know of any SNs matching *{}*! 🙁'.format(a))
+        elif len(found) == 1:
+            replies.extend(format_pubkey(pub, init_len=20) + ':\n' + sn_info(pub) for pub in found)
+        else:
+            replies.append("Found multiple SNs matching *{}*:".format(a))
+            replies.append("\n".join(format_pubkey(pub, init_len=12) + ': ' + sn_value(pub, value_fmt='*T{}*',
+                get=lambda r: tier(r['StakeAmount']) if 'StakeAmount' in r else None) for pub in found))
+
+    if not replies:
+        replies.append("Usage: /sn {PUBKEY|WALLET} -- shows information about matching supernodes")
+
+    send_reply(bot, update, "\n\n".join(replies))
 
 
 def filter_nodes(args, select_from=NODES, empty_means_all=True):
@@ -517,57 +578,38 @@ def filter_nodes(args, select_from=NODES, empty_means_all=True):
 @needs_data
 @send_action(ChatAction.UPLOAD_DOCUMENT)
 def show_sample(bot, update, user_data, args):
-    height, relative = None, False
-    if len(args) >= 1 and re.match(r'^[+-]?\d+$', args[0]):
-        relative = args[0][0] in ('+', '-')
-        height = int(args[0])
-        args = args[1:]
     sns, leftover = filter_nodes(args, select_from=SUPERNODES)
     if leftover:
-        send_reply(bot, update, "❌ Bad arguments!\nUsage: /sample [HEIGHT|+N|-N] [SN ...]"
-                "— shows auth sample for the current height, the given height, or current height ±N")
-        return
-
-    try:
-        curr_height = requests.get(NODES[0][1] + '/getheight').json()['height']
-    except Exception as e:
-        send_reply(bot, update, "⚠ *Something getting wrong* while getting current height 💩")
-        raise e
-
-    if height is None:
-        height = curr_height
-    elif relative:
-        height = curr_height + height
-        if height < 0:
-            send_reply(bot, update, "😝 I can't look up a block before the genesis block!")
-            return
-
-    if height >= curr_height + 20:
-        send_reply(bot, update, "🔮 Error: crystal ball malfunctioned; can't look up more than 19 blocks into the future")
+        send_reply(bot, update, "❌ Bad arguments!\nUsage: /sample [SN ...]"
+                "— shows a random auth sample for the given supernodes (or all supernodes if none are specified)")
         return
 
     loop = asyncio.new_event_loop()
+    payment_id = uuid.uuid4()
+    # Buggy supernode doesn't actually accept the payment IDs it generates in the auth sample url:
+    payment_id = re.sub('-', '', str(payment_id))
+
     results = loop.run_until_complete(get_json_data([
-        sn[1] + '/debug/auth_sample/{}'.format(height) for sn in sns], timeout=2))
+        '{}/debug/auth_sample/{}'.format(sn[1], payment_id) for sn in sns], timeout=2))
     samples = {}
     for sn, r in zip(sns, results):
         if not r:
             continue
         sample = ' '.join(
-                "{}{}".format(format_wallet(sn['Address']), format_tier(tier(sn['StakeAmount']))) for sn in r['result']['items'])
+                "{}{}".format(format_pubkey(sn['PublicId']), format_tier(tier(sn['StakeAmount']))) for sn in r['result']['items'])
         if sample not in samples:
             samples[sample] = []
         samples[sample].append(sn[0])
 
     msg = None
     if not samples:
-        msg = "⚠ *Something getting wrong* while getting auth samples 💩"
+        msg = "⚠ 💩 *Something getting wrong* while getting auth samples for _{}_".format(payment_id)
     elif len(samples) > 1:
         msg = '\n'.join(s+' — ('+', '.join('_'+x+'_' for x in h)+')' for s, h in samples.items())
     else:
         msg = next(iter(samples.keys()))
 
-    send_reply(bot, update, 'Auth sample for height _{}_:\n'.format(height) + msg)
+    send_reply(bot, update, 'Auth sample for payment ID _{}_:\n'.format(payment_id) + msg)
 
 
 @send_action(ChatAction.UPLOAD_DOCUMENT)
@@ -642,74 +684,69 @@ def show_snodes(bot, update, user_data, args):
         r = lastresults[sn[0]]
         if not r:
             st += '_connection failed_'
+            stats.append(st)
             continue
-        count = { x: 0 for x in ('2m', '10m', '1h', 'online', 'offline', 'never') }
+        count = { x: 0 for x in ('2m', '10m', '30m', '1h', 'online', 'unstaked', 'offline', 'gone') }
         for t in range(5):
             count['t{}'.format(t)] = 0
 
         for x in r.values():
+            t = tier(x['StakeAmount'])
             if x['LastUpdateAge'] <= TIMEOUT:
-                count['online'] += 1
-                count['t{}'.format(tier(x['StakeAmount']))] += 1
+                count['online' if t >= 1 else 'unstaked'] += 1
+                count['t{}'.format(t)] += 1
                 if x['LastUpdateAge'] <= 120:
                     count['2m'] += 1
                 elif x['LastUpdateAge'] <= 600:
                     count['10m'] += 1
+                elif x['LastUpdateAge'] <= 1800:
+                    count['30m'] += 1
                 else:
                     count['1h'] += 1
             elif x['LastUpdateAge'] <= 1000000000:
-                count['offline'] += 1
-            else:
-                count['never'] += 1
+                count['offline' if t >= 1 else 'gone'] += 1
 
-        st += '*{online}* 💓, *{offline}* 💔, *{never}* 🛑'.format(**count)
-        if count['online'] > 0:
-            st += '  _({2m}/{10m}/{1h})_  *[{t1}-{t2}-{t3}-{t4}]*'.format(**count)
+        st += '*{online}* 💖,  *{unstaked}* 💗,  *{offline}* 💔,  *{gone}* 🛑'.format(**count)
+        st += '  _({2m}/{10m}/{30m}/{1h})_  *[{t1}-{t2}-{t3}-{t4}]*'.format(**count)
+        st += ' [🔗]({}/debug/supernode_list/1)'.format(sn[1])
 
         stats.append(st)
 
-    stats.append("Legend: 💓=online; 💔=expired; 🛑=offline; _(a/b/c)_=2m/10m/1h uptime counts; *[w-x-y-z]*={}-…-{} counts".format(
+    stats.append("Legend: 💖=active; 💗=unstaked; 💔=staked but offline, 🛑=unstaked and offline\n_(a/b/c/d)_=2m/10m/30m/1h uptime counts; *[w-x-y-z]*={}-…-{} counts".format(
         format_tier(1), format_tier(4)))
 
     send_reply(bot, update, '\n'.join(stats))
 
 
+def my_id(bot, update, user_data):
+    user_id = update.effective_user.id
+    send_reply(bot, update, "Your internal telegram ID is: {}".format(user_id))
 
 
-@needs_data
-def msg_input(bot, update, user_data):
-    global globalsns
+stickers = [
+        'CAADAgADBAMAApzW5woZv2fgJN7_xQI', # Darth vader slap
+        'CAADAgADjAYAAvoLtgj8Z8VBtlewngI', # Criminal racoon gun
+        'CAADAgADBQADV0ZWBoyohnIrCuBCAg', # G(A)RAFT HODL
+        'CAADAgADFAgAAgi3GQJfZ536CxC8DQI', # GC slap
+        'CAADAgADhQMAAgi3GQJJ-luqZysfcQI', # Evil minds Hitler
+        'CAADAgADewEAAooSqg4cZtyuQEZnqQI', # Kermit the frog strangled
+]
+last_sticker = -1
+def slap(bot, update, user_data):
+    global last_sticker
+    last_sticker = (last_sticker + 1) % len(stickers)
 
-    public_chat = update.message.chat.type != 'private'
-    if re.fullmatch(RE_ADDR, update.message.text):
-        send_reply(bot, update, sn_info(update.message.text))
-        return
+    reply_to = update.message.reply_to_message or update.message
+    reply_to.reply_sticker(sticker=stickers[last_sticker], quote=True)
 
-    addrs = []
-    m = re.fullmatch(RE_ADDR_PATTERN, update.message.text)
-    if m:
-        prefix, suffix = m.group(1), m.group(2)
-        for x in globalsns.keys():
-            if x.startswith(prefix) and x.endswith(suffix):
-                addrs.append(x)
 
-        if not addrs:
-            send_reply(bot, update, 'Sorry, but I don\'t know of any SNs matching that pattern! 🙁')
+def sticker_input(bot, update, user_data):
+    print("Got sticker with file_id: {}".format(update.message.sticker.file_id))
 
-    else:
-        if not public_chat:
-            send_reply(bot, update, 'That doesn\'t look like a testnet address.  Send me a SN wallet address to query my stats')
-        return
-
-    if len(addrs) == 1:
-        send_reply(bot, update, sn_info(addrs[0]))
-    else:
-        send_reply(bot, update, '\n\n'.join('{}:\n{}'.format(format_wallet(x), sn_info(x)) for x in addrs))
 
 
 already_sent = set()
 
-@restricted
 @send_action(ChatAction.TYPING)
 def send_stake(bot, update, user_data, args):
 
@@ -733,7 +770,6 @@ def send_stake(bot, update, user_data, args):
         # Don't resend a duplicate /send message
         send_reply(bot, update, "🔴 I'm sorry, Dave, I already opened the pod bay doors 🙁");
         return
-    already_sent.add(reply_to.message_id)
 
     append_usage = "\nUsage: /send {NNN,T1,T2,T3,T4} WALLET [TIER WALLET [...]]"
     stake_details = []
@@ -773,7 +809,34 @@ def send_stake(bot, update, user_data, args):
                 reply_to=reply_to)
         return
 
+    total_to_send = sum(x["amount"] for x in dest)
+
+    try:
+        data = requests.post(WALLET_RPC + '/json_rpc', timeout=2,
+                json={"jsonrpc":"2.0","id":"0","method":"getbalance"}).json()['result']
+        available_balance, available_unlocked = data["balance"], data["unlocked_balance"]
+    except Exception as e:
+        print("An exception occured while fetching the balance:")
+        print(e)
+        return send_reply(bot, update, "⚠ *Something getting wrong* while fetching wallet balance 💩")
+
+    if total_to_send > available_balance:
+        return send_reply(bot, update, "Sorry dude, I'm broke 😭: 💰 *{}* total".format(format_balance(available_balance)))
+    elif total_to_send > available_unlocked:
+        return send_reply(bot, update, "I don't have enough unlocked funds right now: try again in a few blocks (🔓 *{}* unlocked)".format(
+            format_balance(available_unlocked)))
+
+    # Make sure the user is authorized to send; if not, tag the BOSS(es)
+    user_id = update.effective_user.id
+    if user_id not in BOSS_USERS:
+        print("Unauthorized access denied for {}.".format(user_id))
+        send_reply(bot, update, "I'm sorry, Dave.  I'm afraid I can't do that. (You aren't authorized to send funds! — " +
+                " ".join(BOSS_USERS.values()) + " 👆)");
+        return
+
     assert(len(dest) > 0)
+
+    already_sent.add(reply_to.message_id)
 
     try:
         data = requests.post(WALLET_RPC + '/json_rpc', timeout=5,
@@ -794,12 +857,7 @@ def send_stake(bot, update, user_data, args):
             for x in dest:
                 addr, amt = x['address'], x['amount']
                 print('\n    {} -- {}'.format(addr, amt))
-                if addr not in globalsns:
-                    globalsns[addr] = {}
-                if 'funded' not in globalsns[addr]:
-                    globalsns[addr]['funded'] = {}
-                globalsns[addr]['funded'][tx_hash] = amt
-            send_reply(bot, update, "💸 Stake{} sent in [{}...](https://rta.graft.observer/tx/{}):\n{}".format(
+            send_reply(bot, update, "💸 Stake{} sent in [{}...](https://testnet.graft.observer/tx/{}):\n{}".format(
                     '' if len(dest) == 1 else 's',
                     tx_hash[0:8], tx_hash, '\n'.join(stake_details)),
                 reply_to=reply_to)
@@ -890,7 +948,9 @@ def main():
     updater.dispatcher.add_handler(CommandHandler('height', show_height, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(CommandHandler('nodes', show_nodes, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(CommandHandler('snodes', show_snodes, pass_user_data=True, pass_args=True))
-    updater.dispatcher.add_handler(MessageHandler(Filters.text, msg_input, pass_user_data=True))
+    updater.dispatcher.add_handler(CommandHandler('myid', my_id, pass_user_data=True))
+    updater.dispatcher.add_handler(CommandHandler('slap', slap, pass_user_data=True))
+    updater.dispatcher.add_handler(MessageHandler(Filters.sticker, sticker_input, pass_user_data=True))
 
     # log all errors
     dp.add_error_handler(error)
