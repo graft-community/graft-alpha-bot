@@ -11,6 +11,7 @@ import html
 import shelve
 from functools import wraps, partial
 import logging
+import uuid
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, ChatAction
 from telegram.ext import (Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler,
                           PicklePersistence)
