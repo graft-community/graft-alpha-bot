@@ -58,11 +58,20 @@ TIMEOUT = 3600
 # Send out a summary of online nodes at most once every (this number) seconds
 SUMMARY_FREQUENCY = 3600
 
-# Channel/group chat id to send updates to
-SEND_TO = 'FIXME'
+# Channel/group chat id to send updates to, and in which to respond to public messages
+SEND_TO = FIXME
+
+# If set, also sent periodic distribution messages and allow /dist here
+SEND_DIST_TO = FIXME
+
+# If set, any public requests not in SEND_TO will get this reply:
+SEE_SEND_TO = 'Please use a DM or join the bot spam group: https://t.me/GraftSNStatus'
 
 # URL to a wallet rpc for the /send and /balance commands (no trailing /)
-WALLET_RPC = 'http://localhost:55115'
+WALLET_RPC = None
+# 'http://localhost:55115'
+
+TESTNET = False
 
 # Authorized users for restricted commands (e.g. /send)
 # When an unauthorized user sends a /send message, the userid will be printed to stdout
@@ -89,12 +98,14 @@ updater = None
 
 print = partial(print, flush=True)
 
+tier_costs = (0, 50000, 90000, 150000, 250000)
+GRFT = 10000000000
+
 def tier(balance):
-    return (0 if balance <  500000000000000 else
-            1 if balance <  900000000000000 else
-            2 if balance < 1500000000000000 else
-            3 if balance < 2500000000000000 else
-            4)
+    for i, c in enumerate(tier_costs):
+        if balance < c * GRFT:
+            return i - 1
+    return len(tier_costs) - 1
 
 
 def format_wallet(addr, markup='*', init_len=6):
@@ -180,6 +191,16 @@ def needs_data(func):
     return wrapped
 
 
+def nospam(func):
+    @wraps(func)
+    def wrapped(bot, update, *args, **kwargs):
+        if SEE_SEND_TO and update.message.chat.type != 'private' and update.message.chat_id != SEND_TO:
+            return send_reply(bot, update, SEE_SEND_TO)
+        else:
+            return func(bot, update, *args, **kwargs)
+    return wrapped
+
+
 eighths = ' ▏▎▍▌▋▊▉█'
 
 def get_dist(results = None):
@@ -194,25 +215,27 @@ def get_dist(results = None):
             t = g['tier']
             num_tiers[t] += 1
             total_balance += g['stake']
-            total_stakes += (50 if t == 1 else 90 if t == 2 else 150 if t == 3 else 250 if t == 4 else 0)
-    total_stakes *= 10000000000000
+            total_stakes += tier_costs[t] * GRFT
 
     num_sns = sum(num_tiers[1:])
     if num_sns == 0:
         return 'I\'m still starting up; try again later'
     num_offline = len(globalsns) - num_sns
-    pct_tiers = [x / num_sns * 100 for x in num_tiers[1:]]
+    pct_tiers = [x / num_sns * 100 for x in num_tiers]
     global eighths
     blocks = []
-    for i in range(len(pct_tiers)):
-        x = pct_tiers[i] * 2
+    for i, pct in enumerate(pct_tiers[1:]):
+        x = pct * 2
         blocks.append('█' * int(x // 8))
         e = round(x % 8)
         if e > 0:
             blocks[-1] += eighths[e]
     dist = "*Supernode distribution:*\n"
-    for t in (1, 2, 3, 4):
-        dist += ('T{}: ' + blocks[t-1] + " ({} = {:.1f}%)\n").format(t, num_tiers[t], pct_tiers[t-1])
+    for t, n in enumerate(num_tiers):
+        if t == 0:
+            continue
+        rroi = num_tiers[1]*tier_costs[1] / (n*tier_costs[t])
+        dist += ('T{}: ' + blocks[t-1] + " ({} = {:.1f}%; RROI = {:.1f}%)\n").format(t, n, pct_tiers[t], rroi*100)
     dist += '{} supernode{} online and staked\n'.format(num_sns, 's' if num_sns != 1 else '')
     now = time.time()
     dist += 'Uptimes: *{}* ≤ _2m_, *{}* ≤ _10m_, *{}* ≤ _30m_, *{}* ≤ _1h_\n'.format(
@@ -232,11 +255,12 @@ def get_dist(results = None):
                 'some' if count > 1 else 'one')
         online_on[key] += 1
 
-    dist += 'Network:\n_{all}_/_{most}_/_{some}_/_{one}_ SNs online on all/most/some/one queried SNs\n'.format(**online_on)
+    if len(SUPERNODES) > 1:
+        dist += 'Network:\n_{all}_/_{most}_/_{some}_/_{one}_ SNs online on all/most/some/one queried SNs\n'.format(**online_on)
 
     if num_tiers[0] > 0:
         dist += '{} supernode{} online with < T1 stake\n'.format(num_tiers[0], 's' if num_tiers[0] != 1 else '')
-    dist += '{} supernode{} offline'.format(num_offline, 's' if num_offline != 1 else '')
+    #dist += '{} supernode{} offline'.format(num_offline, 's' if num_offline != 1 else '')
 
     dist += '\nOnline stakes: *{}* (*{}* required)'.format(
             format_balance(total_balance), format_balance(total_stakes))
@@ -277,7 +301,7 @@ def rta_updater():
 
     while not time_to_die:
         if time.time() - last < 60:
-            time.sleep(0.25)
+            time.sleep(1.0)
             continue
 
         results = loop.run_until_complete(get_json_data([
@@ -402,6 +426,8 @@ def rta_updater():
         if now - last_summary >= SUMMARY_FREQUENCY:
             updates.append(get_dist(results))
             last_summary = now
+            if SEND_DIST_TO and SEND_DIST_TO != SEND_TO:
+                updater.bot.send_message(SEND_DIST_TO, updates[-1], parse_mode=ParseMode.MARKDOWN)
 
         if updates:
             try:
@@ -413,6 +439,7 @@ def rta_updater():
         lastresults = results
 
 
+@nospam
 def start(bot, update, user_data):
     reply_text = 'Hi!  I\'m here to help manage the RTA group with status updates and sending stakes.  I can also look up an individual SN for you: just send me the address.'
     reply_text += '\n(If I break, you should contact ' + OWNER + ')\n'
@@ -430,7 +457,10 @@ Supported commands:
 /snodes — shows the status of the graft supernodes this bot talks to.
 
 /height — shows the current height (or heights) on the nodes this bot talks to.
+'''
 
+    if WALLET_RPC and TESTNET:
+        reply_text += '''
 /balance — shows the balance of the bot's wallet for sending out test stakes.
 
 /donate — shows the bot's address (to help replenish the bot's available funds).
@@ -511,12 +541,17 @@ def sn_info(pub):
                 msgs[-1] += ' — ('+', '.join('_'+x+'_' for x in offline_for)+')'
         return '\n'.join(msgs)
 
-RE_ADDR = r'F[3-9A-D][1-9a-km-zA-HJ-NP-Z]{93}'
-RE_ADDR_PATTERN = r'(F[3-9A-D][1-9a-km-zA-HJ-NP-Z]{3,93})(?:\.+([1-9a-km-zA-HJ-NP-Z]{0,90}))?'
+if TESTNET:
+    RE_ADDR = r'F[3-9A-D][1-9a-km-zA-HJ-NP-Z]{93}'
+    RE_ADDR_PATTERN = r'(F[3-9A-D][1-9a-km-zA-HJ-NP-Z]{3,93})(?:\.+([1-9a-km-zA-HJ-NP-Z]{0,90}))?'
+else:
+    RE_ADDR = r'G[4-9A-D][1-9a-km-zA-HJ-NP-Z]{93}'
+    RE_ADDR_PATTERN = r'(G[4-9A-D][1-9a-km-zA-HJ-NP-Z]{3,93})(?:\.+([1-9a-km-zA-HJ-NP-Z]{0,90}))?'
 
 RE_PUB = r'[0-9a-f]{64}'
 RE_PUB_PATTERN = r'([0-9a-f]{5,64})(?:\.+([0-9a-f]{0,59}))?'
 
+@nospam
 @needs_data
 def show_sn(bot, update, user_data, args):
     global globalsns
@@ -534,14 +569,13 @@ def show_sn(bot, update, user_data, args):
             if m:
                 prefix, suffix = m.group(1), m.group(2)
                 for pub, x in globalsns.items():
-                    print(x)
                     if 'wallet' not in x:
                         continue
                     addr = x['wallet']
                     if addr.startswith(prefix) and (suffix is None or addr.endswith(suffix)):
                         found.append(pub)
             else:
-                replies.append('*{}* doesn\'t look like a valid SN id or testnet wallet address'.format(a))
+                replies.append('*{}* doesn\'t look like a valid SN id or {}wallet address'.format(a, 'testnet ' if TESTNET else ''))
                 continue
 
         if not found:
@@ -576,6 +610,7 @@ def filter_nodes(args, select_from=NODES, empty_means_all=True):
     return (ns, leftover)
 
 
+@nospam
 @needs_data
 @send_action(ChatAction.UPLOAD_DOCUMENT)
 def show_sample(bot, update, user_data, args):
@@ -613,6 +648,7 @@ def show_sample(bot, update, user_data, args):
     send_reply(bot, update, 'Auth sample for payment ID _{}_:\n'.format(payment_id) + msg)
 
 
+@nospam
 @send_action(ChatAction.UPLOAD_DOCUMENT)
 def show_height(bot, update, user_data, args):
     ns, leftover = filter_nodes(args)
@@ -645,6 +681,7 @@ def show_height(bot, update, user_data, args):
     send_reply(bot, update, msg)
 
 
+@nospam
 @send_action(ChatAction.UPLOAD_DOCUMENT)
 def show_nodes(bot, update, user_data, args):
     ns, leftover = filter_nodes(args)
@@ -671,6 +708,7 @@ def show_nodes(bot, update, user_data, args):
     send_reply(bot, update, '\n'.join(status))
 
 
+@nospam
 @needs_data
 def show_snodes(bot, update, user_data, args):
     global lastresults
@@ -724,6 +762,11 @@ def my_id(bot, update, user_data):
     send_reply(bot, update, "Your internal telegram ID is: {}".format(user_id))
 
 
+def chat_id(bot, update, user_data):
+    chat_id = update.message.chat_id
+    send_reply(bot, update, "Telegram chat id: {}".format(chat_id))
+
+
 stickers = [
         'CAADAgADBAMAApzW5woZv2fgJN7_xQI', # Darth vader slap
         'CAADAgADjAYAAvoLtgj8Z8VBtlewngI', # Criminal racoon gun
@@ -733,6 +776,7 @@ stickers = [
         'CAADAgADewEAAooSqg4cZtyuQEZnqQI', # Kermit the frog strangled
 ]
 last_sticker = -1
+@nospam
 def slap(bot, update, user_data):
     global last_sticker
     last_sticker = (last_sticker + 1) % len(stickers)
@@ -780,7 +824,7 @@ def send_stake(bot, update, user_data, args):
         for i in range(0, len(args), 2):
             tier, wallet = args[i:i+2]
             if not re.fullmatch(RE_ADDR, wallet):
-                bad = '{} does not look like a valid testnet wallet address'.format(wallet)
+                bad = '{} does not look like a valid {}wallet address'.format(wallet, 'testnet ' if TESTNET else '')
                 break
 
             amount = 0
@@ -941,15 +985,17 @@ def main():
 
     updater.dispatcher.add_handler(CommandHandler('start', start, pass_user_data=True))
     updater.dispatcher.add_handler(CommandHandler('dist', show_dist, pass_user_data=True))
-    updater.dispatcher.add_handler(CommandHandler('send', send_stake, pass_user_data=True, pass_args=True))
-    updater.dispatcher.add_handler(CommandHandler('balance', balance, pass_user_data=True))
-    updater.dispatcher.add_handler(CommandHandler('donate', donate, pass_user_data=True))
+    if WALLET_RPC and TESTNET:
+        updater.dispatcher.add_handler(CommandHandler('send', send_stake, pass_user_data=True, pass_args=True))
+        updater.dispatcher.add_handler(CommandHandler('balance', balance, pass_user_data=True))
+        updater.dispatcher.add_handler(CommandHandler('donate', donate, pass_user_data=True))
     updater.dispatcher.add_handler(CommandHandler('sn', show_sn, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(CommandHandler('sample', show_sample, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(CommandHandler('height', show_height, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(CommandHandler('nodes', show_nodes, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(CommandHandler('snodes', show_snodes, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(CommandHandler('myid', my_id, pass_user_data=True))
+    updater.dispatcher.add_handler(CommandHandler('chatid', chat_id, pass_user_data=True))
     updater.dispatcher.add_handler(CommandHandler('slap', slap, pass_user_data=True))
     updater.dispatcher.add_handler(MessageHandler(Filters.sticker, sticker_input, pass_user_data=True))
 
