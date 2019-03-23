@@ -95,6 +95,7 @@ pp = None
 globalsns = None
 lastresults = None
 updater = None
+notifications = {}
 
 print = partial(print, flush=True)
 
@@ -292,7 +293,7 @@ async def get_json_data(urls, timeout=10):
 
 time_to_die = False
 def rta_updater():
-    global lastresults, time_to_die, updater
+    global lastresults, time_to_die, updater, notifications
     last = 0
     first = ANNOUNCE_LIFE
     last_summary = time.time()
@@ -397,31 +398,43 @@ def rta_updater():
                 timeouts.append(row)
 
         updates = []
+        def add_update(pubkey, msg):
+            updates.append(msg)
+            if pubkey in notifications:
+                for uid in notifications[pubkey]:
+                    bot.send_message(uid, msg, parse_mode=ParseMode.MARKDOWN)
+
         if first:
             updates.append("I'm alive! 🍚 🍅 🍏")
         for x in new_sns:
             if x['tier'] > 0:
-                updates.append("💖 New *T{}* supernode appeared: {}".format(x['tier'], format_pubkey(x['pubkey'])))
+                msg = "💖 New *T{}* supernode appeared: {}".format(x['tier'], format_pubkey(x['pubkey']))
             else:
-                updates.append("💗 New unstaked supernode appeared: {}".format(format_pubkey(x['pubkey'])))
+                msg = "💗 New unstaked supernode appeared: {}".format(format_pubkey(x['pubkey']))
+            add_update(x['pubkey'], msg)
+
         for p, old_tier in tier_was.items():
             new_tier = globalsns[p]['tier']
+            msg = None
             if new_tier > old_tier:
                 if old_tier == 0:
-                    updates.append("💖 {} activated as a *T{}*".format(format_pubkey(p), new_tier))
+                    msg = "💖 {} activated as a *T{}*".format(format_pubkey(p), new_tier)
                 else:
-                    updates.append("💰 {} upgraded from *T{}* to *T{}*".format(format_pubkey(p), old_tier, new_tier))
+                    msg = "💰 {} upgraded from *T{}* to *T{}*".format(format_pubkey(p), old_tier, new_tier)
             elif new_tier < old_tier:
                 if new_tier == 0:
-                    updates.append("📅 {} expired (was a *T{}*)".format(format_pubkey(p), old_tier))
+                    msg = "📅 {} expired (was a *T{}*)".format(format_pubkey(p), old_tier)
                 else:
-                    updates.append("😢 {} downgraded from *T{}* to *T{}*".format(format_pubkey(p), old_tier, new_tier))
+                    msg = "😢 {} downgraded from *T{}* to *T{}*".format(format_pubkey(p), old_tier, new_tier)
+            if msg:
+                add_update(p, msg)
+
         for x in returns:
-            updates.append("💓 {} is back online _(after {})_!".format(
+            add_update(x['pubkey'], "💓 {} is back online _(after {})_!".format(
                 format_pubkey(x['pubkey']),
                 'unknown' if x['pubkey'] not in came_online_after else friendly_ago(came_online_after[x['pubkey']])))
         for x in timeouts:
-            updates.append("💔 {} is offline!".format(format_pubkey(x['pubkey'])))
+            add_update(x['pubkey'], "💔 {} is offline!".format(format_pubkey(x['pubkey'])))
 
         if now - last_summary >= SUMMARY_FREQUENCY:
             updates.append(get_dist(results))
@@ -447,6 +460,8 @@ def start(bot, update, user_data):
 Supported commands:
 
 /sn {PUBKEY|WALLET} — queries the status of the given SN, identified by public key *or* wallet address, from a few different supernodes on the network.  The key (or wallet) can also be specified in a shortened form such as *01abcdef...*
+
+/track PUBKEY — toggles sending any status updates about the given SN to you via direct message.  PUBKEY must be a full SN public id, and this command can only be issued to the bot via direct message.  Repeat
 
 /dist — shows the current active SN distribution across tiers.
 
@@ -591,6 +606,41 @@ def show_sn(bot, update, user_data, args):
         replies.append("Usage: /sn {PUBKEY|WALLET} -- shows information about matching supernodes")
 
     send_reply(bot, update, "\n\n".join(replies))
+
+
+def track_sn(bot, update, user_data, args):
+    if update.message.chat.type != 'private':
+        return send_reply(bot, update, 'Sorry, that command can only be used in a direct message')
+
+    global globalsns
+    user_id = update.effective_user.id
+
+    pks = []
+    for a in args:
+        if re.fullmatch(RE_PUB, a):
+            pks.append(a)
+        else:
+            return send_reply(bot, update, "Invalid public key _{}_.  Usage: /track PUBKEY [...] — specify one or more full SN public keys".format(a))
+    if not pks:
+        return send_reply(bot, update, "No public keys specified!  Usage: /track PUBKEY [...] — specify one or more full SN public keys")
+
+    msgs = []
+    if 'notify_about' not in user_data:
+        user_data['notify_about'] = set()
+    for pk in pks:
+        if pk in user_data['notify_about']:
+            user_data['notify_about'].remove(pk)
+            if pk in notifications and update.effective_user.id in notifications[pk]:
+                notifications[pk].remove(update.effective_user.id)
+            msgs.append("❌ No longer monitoring {} for you".format(pk))
+        else:
+            user_data['notify_about'].add(pk)
+            if pk not in notifications:
+                notifications[pk] = set()
+            notifications[pk].add(update.effective_user.id)
+            msgs.append("✅ Started monitoring {} for you".format(pk))
+    pp.flush()
+    send_reply(bot, update, "\n\n".join(msgs))
 
 
 def filter_nodes(args, select_from=NODES, empty_means_all=True):
@@ -745,13 +795,13 @@ def show_snodes(bot, update, user_data, args):
             elif x['LastUpdateAge'] <= 1000000000:
                 count['offline' if t >= 1 else 'gone'] += 1
 
-        st += '*{online}* 💖,  *{unstaked}* 💗,  *{offline}* 💔,  *{gone}* 🛑'.format(**count)
+        st += '*{online}* 💖,  *{unstaked}* 💗,  *{offline}* 💔'.format(**count)
         st += '  _({2m}/{10m}/{30m}/{1h})_  *[{t1}-{t2}-{t3}-{t4}]*'.format(**count)
-        st += ' [🔗]({}/debug/supernode_list/1)'.format(sn[1])
+        #st += ' [🔗]({}/debug/supernode_list/1)'.format(sn[1])
 
         stats.append(st)
 
-    stats.append("Legend: 💖=active; 💗=unstaked; 💔=staked but offline, 🛑=unstaked and offline\n_(a/b/c/d)_=2m/10m/30m/1h uptime counts; *[w-x-y-z]*={}-…-{} counts".format(
+    stats.append("Legend: 💖=active; 💗=unstaked; 💔=staked but offline\n_(a/b/c/d)_=2m/10m/30m/1h uptime counts; *[w-x-y-z]*={}-…-{} counts".format(
         format_tier(1), format_tier(4)))
 
     send_reply(bot, update, '\n'.join(stats))
@@ -969,12 +1019,20 @@ def error(bot, update, error):
 
 def main():
     print("Starting bot")
-    global pp, updater, globalsns
+    global pp, updater, globalsns, notifications
 
     globalsns = shelve.open(PERSISTENCE_GLOBAL_SNS_FILENAME, writeback=True)
 
     # Create the Updater and pass it your bot's token.
     pp = PicklePersistence(filename=PERSISTENCE_USER_FILENAME, store_user_data=True, store_chat_data=False, on_flush=True)
+
+    for uid, data in pp.get_user_data().items():
+        if 'notify_about' in data:
+            for pubkey in data['notify_about']:
+                if pubkey not in notifications:
+                    notifications[pubkey] = set()
+                notifications[pubkey].add(uid)
+
     updater = Updater(TELEGRAM_TOKEN, persistence=pp,
             user_sig_handler=stop_rta_thread)
 
@@ -990,6 +1048,7 @@ def main():
         updater.dispatcher.add_handler(CommandHandler('balance', balance, pass_user_data=True))
         updater.dispatcher.add_handler(CommandHandler('donate', donate, pass_user_data=True))
     updater.dispatcher.add_handler(CommandHandler('sn', show_sn, pass_user_data=True, pass_args=True))
+    updater.dispatcher.add_handler(CommandHandler('track', track_sn, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(CommandHandler('sample', show_sample, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(CommandHandler('height', show_height, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(CommandHandler('nodes', show_nodes, pass_user_data=True, pass_args=True))
