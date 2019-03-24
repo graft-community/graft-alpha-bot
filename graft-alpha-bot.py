@@ -55,6 +55,9 @@ OWNER = 'FIXME'
 # Warn about a SN going offline if the last uptime becomes greater than this many minutes
 TIMEOUT = 3600
 
+# Minimum count of online among queried SNs needed to consider a remote SN as online
+ONLINE_MIN_COUNT = 2
+
 # Send out a summary of online nodes at most once every (this number) seconds
 SUMMARY_FREQUENCY = 3600
 
@@ -301,155 +304,162 @@ def rta_updater():
     loop = asyncio.new_event_loop()
 
     while not time_to_die:
-        if time.time() - last < 60:
-            time.sleep(1.0)
-            continue
-
-        results = loop.run_until_complete(get_json_data([
-            sn[1] + '/debug/supernode_list/1' for sn in SUPERNODES]))
-
-        results = dict(zip(
-            (s[0] for s in SUPERNODES),
-            ({ x['PublicId']: x for x in r['result']['items'] } if r else None for r in results)
-        ))
-
-        if not any(results.values()):
-            print("Something getting very wrong: all SNs returned nothing!")
-            time.sleep(3)
-            continue
-
-        now = time.time()
-        last = now
-
-        # Each of these contain: { 'addr': 'F...', 'age': 123, 'tier': [0-4], 'old_tier': [0-4] }
-        # (old_tier is only set if the SN was seen last time and the tier has changed)
-        new_pub = set() 
-        new_sns = []
-        timeouts = []
-        returns = []
-        tier_was = {}
-        went_offline = set()
-        came_online_after = {}
-
-        for sn in SUPERNODES:
-            stats = results[sn[0]]
-            if not stats:
+        try:
+            if time.time() - last < 60:
+                time.sleep(1.0)
                 continue
-            for p in stats.keys():
-                if p not in globalsns:
-                    globalsns[p] = {}
-                    new_pub.add(p)
 
-        for p, g in globalsns.items():
-            for k in ('last_seen', 'tier'):
-                if k not in g:
-                    g[k] = None
+            results = loop.run_until_complete(get_json_data([
+                sn[1] + '/debug/supernode_list/1' for sn in SUPERNODES]))
 
-            best_age = None
-            biggest_stake = None
-            wallet = None
+            results = dict(zip(
+                (s[0] for s in SUPERNODES),
+                ({ x['PublicId']: x for x in r['result']['items'] } if r else None for r in results)
+            ))
+
+            if not any(results.values()):
+                print("Something getting very wrong: all SNs returned nothing!")
+                time.sleep(3)
+                continue
+
+            now = time.time()
+            last = now
+
+            # Each of these contain: { 'addr': 'F...', 'age': 123, 'tier': [0-4], 'old_tier': [0-4] }
+            # (old_tier is only set if the SN was seen last time and the tier has changed)
+            new_pub = set() 
+            new_sns = []
+            timeouts = []
+            returns = []
+            tier_was = {}
+            went_offline = set()
+            came_online_after = {}
+
             for sn in SUPERNODES:
-                sn_tag = sn[0]
-                stats = results[sn_tag]
-                if not stats or p not in stats:
+                stats = results[sn[0]]
+                if not stats:
                     continue
-                age = stats[p]['LastUpdateAge']
-                if best_age is None or age < best_age:
-                    best_age = age
-                stake = stats[p]['StakeAmount']
-                if biggest_stake is None or stake > biggest_stake:
-                    biggest_stake = stake
-                    wallet = stats[p]['Address']
-            seen = None if best_age is None or best_age > 1000000000 else now - best_age
-            if seen and (g['last_seen'] is None or seen > g['last_seen']):
-                g['last_seen'] = seen
-            if biggest_stake is not None:
-                g['stake'] = biggest_stake
-                t = tier(biggest_stake)
-                if g['tier'] != t and g['tier'] is not None:
-                    tier_was[p] = g['tier']
-                g['tier'] = tier(biggest_stake)
-                g['wallet'] = wallet
+                for p in stats.keys():
+                    if p not in globalsns:
+                        globalsns[p] = {}
+                        new_pub.add(p)
 
-            if g['last_seen'] is None or g['last_seen'] < now - TIMEOUT:
-                if 'online_since' in g:
-                    del g['online_since']
-                    went_offline.add(p)
-                if 'offline_since' not in g:
-                    g['offline_since'] = now if g['last_seen'] is None else g['last_seen'] + TIMEOUT
-            else:
-                if 'offline_since' in g:
-                    came_online_after[p] = now - g['offline_since']
-                    del g['offline_since']
-                if 'online_since' not in g:
-                    g['online_since'] = g['last_seen']
+            for p, g in globalsns.items():
+                for k in ('last_seen', 'tier'):
+                    if k not in g:
+                        g[k] = None
 
-            seen, t = g['last_seen'], g['tier']
-            seen_by = [x[0] for x in SUPERNODES if x[0] in results and results[x[0]] and p in results[x[0]]]
-            age = None if seen is None else now - seen
-            row = { 'pubkey': p, 'wallet': wallet, 'age': age, 'tier': t, 'seen_by': seen_by }
-            if p in new_pub:
-                if age is not None and age < TIMEOUT:
-                    new_sns.append(row)
-                continue
-            elif p in came_online_after:
-                returns.append(row)
-            elif p in went_offline:
-                timeouts.append(row)
+                count_online = 0
+                best_age = None
+                biggest_stake = None
+                wallet = None
+                for sn in SUPERNODES:
+                    sn_tag = sn[0]
+                    stats = results[sn_tag]
+                    if not stats or p not in stats:
+                        continue
+                    age = stats[p]['LastUpdateAge']
+                    if age < TIMEOUT:
+                        count_online += 1
+                    if best_age is None or age < best_age:
+                        best_age = age
+                    stake = stats[p]['StakeAmount']
+                    if biggest_stake is None or stake > biggest_stake:
+                        biggest_stake = stake
+                        wallet = stats[p]['Address']
+                seen = None if best_age is None or best_age > 1000000000 or count_online < ONLINE_MIN_COUNT else now - best_age
+                if seen and (g['last_seen'] is None or seen > g['last_seen']):
+                    g['last_seen'] = seen
+                if biggest_stake is not None:
+                    g['stake'] = biggest_stake
+                    t = tier(biggest_stake)
+                    if g['tier'] != t and g['tier'] is not None:
+                        tier_was[p] = g['tier']
+                    g['tier'] = tier(biggest_stake)
+                    g['wallet'] = wallet
 
-        updates = []
-        def add_update(pubkey, msg):
-            updates.append(msg)
-            if pubkey in notifications:
-                for uid in notifications[pubkey]:
-                    bot.send_message(uid, msg, parse_mode=ParseMode.MARKDOWN)
-
-        if first:
-            updates.append("I'm alive! 🍚 🍅 🍏")
-        for x in new_sns:
-            if x['tier'] > 0:
-                msg = "💖 New *T{}* supernode appeared: {}".format(x['tier'], format_pubkey(x['pubkey']))
-            else:
-                msg = "💗 New unstaked supernode appeared: {}".format(format_pubkey(x['pubkey']))
-            add_update(x['pubkey'], msg)
-
-        for p, old_tier in tier_was.items():
-            new_tier = globalsns[p]['tier']
-            msg = None
-            if new_tier > old_tier:
-                if old_tier == 0:
-                    msg = "💖 {} activated as a *T{}*".format(format_pubkey(p), new_tier)
+                if g['last_seen'] is None or g['last_seen'] < now - TIMEOUT or count_online < ONLINE_MIN_COUNT:
+                    if 'online_since' in g:
+                        del g['online_since']
+                        went_offline.add(p)
+                    if 'offline_since' not in g:
+                        g['offline_since'] = now if g['last_seen'] is None else g['last_seen'] + TIMEOUT
                 else:
-                    msg = "💰 {} upgraded from *T{}* to *T{}*".format(format_pubkey(p), old_tier, new_tier)
-            elif new_tier < old_tier:
-                if new_tier == 0:
-                    msg = "📅 {} expired (was a *T{}*)".format(format_pubkey(p), old_tier)
+                    if 'offline_since' in g:
+                        came_online_after[p] = now - g['offline_since']
+                        del g['offline_since']
+                    if 'online_since' not in g:
+                        g['online_since'] = g['last_seen']
+
+                seen, t = g['last_seen'], g['tier']
+                age = None if seen is None else now - seen
+                row = { 'pubkey': p, 'wallet': wallet, 'age': age, 'tier': t }
+                if p in new_pub:
+                    if age is not None and age < TIMEOUT:
+                        new_sns.append(row)
+                    continue
+                elif p in came_online_after:
+                    returns.append(row)
+                elif p in went_offline:
+                    timeouts.append(row)
+
+            updates = []
+            def add_update(pubkey, msg):
+                updates.append(msg)
+                if pubkey in notifications:
+                    for uid in notifications[pubkey]:
+                        updater.bot.send_message(uid, msg, parse_mode=ParseMode.MARKDOWN)
+
+            if first:
+                updates.append("I'm alive! 🍚 🍅 🍏")
+            for x in new_sns:
+                if x['tier'] > 0:
+                    msg = "💖 New *T{}* supernode appeared: {}".format(x['tier'], format_pubkey(x['pubkey']))
                 else:
-                    msg = "😢 {} downgraded from *T{}* to *T{}*".format(format_pubkey(p), old_tier, new_tier)
-            if msg:
-                add_update(p, msg)
+                    msg = "💗 New unstaked supernode appeared: {}".format(format_pubkey(x['pubkey']))
+                add_update(x['pubkey'], msg)
 
-        for x in returns:
-            add_update(x['pubkey'], "💓 {} is back online _(after {})_!".format(
-                format_pubkey(x['pubkey']),
-                'unknown' if x['pubkey'] not in came_online_after else friendly_ago(came_online_after[x['pubkey']])))
-        for x in timeouts:
-            add_update(x['pubkey'], "💔 {} is offline!".format(format_pubkey(x['pubkey'])))
+            for p, old_tier in tier_was.items():
+                new_tier = globalsns[p]['tier']
+                msg = None
+                if new_tier > old_tier:
+                    if old_tier == 0:
+                        msg = "💖 {} activated as a *T{}*".format(format_pubkey(p), new_tier)
+                    else:
+                        msg = "💰 {} upgraded from *T{}* to *T{}*".format(format_pubkey(p), old_tier, new_tier)
+                elif new_tier < old_tier:
+                    if new_tier == 0:
+                        msg = "📅 {} expired (was a *T{}*)".format(format_pubkey(p), old_tier)
+                    else:
+                        msg = "😢 {} downgraded from *T{}* to *T{}*".format(format_pubkey(p), old_tier, new_tier)
+                if msg:
+                    add_update(p, msg)
 
-        if now - last_summary >= SUMMARY_FREQUENCY:
-            updates.append(get_dist(results))
-            last_summary = now
-            if SEND_DIST_TO and SEND_DIST_TO != SEND_TO:
-                updater.bot.send_message(SEND_DIST_TO, updates[-1], parse_mode=ParseMode.MARKDOWN)
+            for x in returns:
+                add_update(x['pubkey'], "💓 {} is back online _(after {})_!".format(
+                    format_pubkey(x['pubkey']),
+                    'unknown' if x['pubkey'] not in came_online_after else friendly_ago(came_online_after[x['pubkey']])))
+            for x in timeouts:
+                add_update(x['pubkey'], "💔 {} is offline!".format(format_pubkey(x['pubkey'])))
 
-        if updates:
-            try:
-                updater.bot.send_message(SEND_TO, '\n'.join(updates), parse_mode=ParseMode.MARKDOWN)
-                first = False
-            except Exception as e:
-                print("An exception occured during updating/notifications: {}".format(e))
-                continue
-        lastresults = results
+            if now - last_summary >= SUMMARY_FREQUENCY:
+                updates.append(get_dist(results))
+                last_summary = now
+                if SEND_DIST_TO and SEND_DIST_TO != SEND_TO:
+                    updater.bot.send_message(SEND_DIST_TO, updates[-1], parse_mode=ParseMode.MARKDOWN)
+
+            if updates:
+                try:
+                    updater.bot.send_message(SEND_TO, '\n'.join(updates), parse_mode=ParseMode.MARKDOWN)
+                    first = False
+                except Exception as e:
+                    print("An exception occured during updating/notifications: {}".format(e))
+                    continue
+            lastresults = results
+        except Exception:
+            import traceback
+            print("Oh noes! Exception!")
+            print(traceback.format_exc())
 
 
 @nospam
@@ -462,6 +472,8 @@ Supported commands:
 /sn {PUBKEY|WALLET} — queries the status of the given SN, identified by public key *or* wallet address, from a few different supernodes on the network.  The key (or wallet) can also be specified in a shortened form such as *01abcdef...*
 
 /track PUBKEY — toggles sending any status updates about the given SN to you via direct message.  PUBKEY must be a full SN public id, and this command can only be issued to the bot via direct message.  Repeat
+
+/tracking — lists all the pubkeys you are currently tracking via /track
 
 /dist — shows the current active SN distribution across tiers.
 
@@ -533,8 +545,10 @@ def sn_info(pub):
             get=lambda r: tier(r['StakeAmount']) if 'StakeAmount' in r else None))
         msgs.append('*Stake:* ' + sn_value(pub, join='\n*Stake:* ', value_fmt='{}',
             get=lambda r: '{:.10f} _GRFT_'.format(r['StakeAmount'] * 1e-10).rstrip('0').rstrip('.') if 'StakeAmount' in r else None))
+        msgs.append('*Stake activated:* Block ' + sn_value(pub,
+            get=lambda r: r['StakeFirstValidBlock'] if 'StakeFirstValidBlock' in r else None))
         msgs.append('*Stake expiry:* Block ' + sn_value(pub,
-            get=lambda r: r['ExpiringBlock'] if 'ExpiringBlock' in r else None))
+            get=lambda r: r['StakeExpiringBlock'] if 'StakeExpiringBlock' in r else r['ExpiringBlock'] if 'ExpiringBlock' in r else None))
         msgs.append('*Wallet:* ' + sn_value(pub, join='\n*Wallet:* ',
             get=lambda r: format_wallet(r['Address'], init_len=15, markup='') if 'Address' in r else None))
 
@@ -641,6 +655,24 @@ def track_sn(bot, update, user_data, args):
             msgs.append("✅ Started monitoring {} for you".format(pk))
     pp.flush()
     send_reply(bot, update, "\n\n".join(msgs))
+
+
+def show_tracking(bot, update, user_data, args):
+    if update.message.chat.type != 'private':
+        return send_reply(bot, update, 'Sorry, that command can only be used in a direct message')
+
+    global globalsns
+    user_id = update.effective_user.id
+
+    if 'notify_about' not in user_data or not user_data['notify_about']:
+        return send_reply(bot, update, "I am not currently tracking an SNs for you")
+
+    num = len(user_data['notify_about'])
+    msg = 'Currently tracking *{}* SN{} for you:'.format(num, '' if num == 1 else 's')
+    for sn in sorted(user_data['notify_about']):
+        msg += "\n\n" + sn
+
+    send_reply(bot, update, msg)
 
 
 def filter_nodes(args, select_from=NODES, empty_means_all=True):
@@ -801,7 +833,7 @@ def show_snodes(bot, update, user_data, args):
 
         stats.append(st)
 
-    stats.append("Legend: 💖=active; 💗=unstaked; 💔=staked but offline\n_(a/b/c/d)_=2m/10m/30m/1h uptime counts; *[w-x-y-z]*={}-…-{} counts".format(
+    stats.append("Legend:\n💖=active; 💗=unstaked; 💔=staked but offline\n_(a/b/c/d)_=2m/10m/30m/1h uptime counts\n*[w-x-y-z]*={}-…-{} counts".format(
         format_tier(1), format_tier(4)))
 
     send_reply(bot, update, '\n'.join(stats))
@@ -1049,6 +1081,7 @@ def main():
         updater.dispatcher.add_handler(CommandHandler('donate', donate, pass_user_data=True))
     updater.dispatcher.add_handler(CommandHandler('sn', show_sn, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(CommandHandler('track', track_sn, pass_user_data=True, pass_args=True))
+    updater.dispatcher.add_handler(CommandHandler('tracking', show_tracking, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(CommandHandler('sample', show_sample, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(CommandHandler('height', show_height, pass_user_data=True, pass_args=True))
     updater.dispatcher.add_handler(CommandHandler('nodes', show_nodes, pass_user_data=True, pass_args=True))
