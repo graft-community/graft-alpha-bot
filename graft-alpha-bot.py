@@ -9,6 +9,7 @@ import aiohttp
 import json.decoder
 import html
 import shelve
+import random
 from functools import wraps, partial
 import logging
 import uuid
@@ -56,10 +57,10 @@ OWNER = 'FIXME'
 TIMEOUT = 3600
 
 # Minimum count of online among queried SNs needed to consider a remote SN as online
-ONLINE_MIN_COUNT = 2
+ONLINE_MIN_COUNT = 3
 
 # Send out a summary of online nodes at most once every (this number) seconds
-SUMMARY_FREQUENCY = 3600
+SUMMARY_FREQUENCY = 4*60*60
 
 # Channel/group chat id to send updates to, and in which to respond to public messages
 SEND_TO = FIXME
@@ -85,10 +86,26 @@ BOSS_USERS = {
 # Enable to broadcast "I'm alive" upon startup
 ANNOUNCE_LIFE = False
 
+# Tiers (element 0 should always be 0)
+TIER_COSTS = (0, 50000, 90000, 150000, 250000)
+
+# Daily total stimulus payments (used to calculate ROI)
+#STIMULUS_PER_DAY = 115200
+
+#Jason, [10.04.19 22:19]
+# It looks like the stimulus system is not quite running at 1 stim per minute.
+#Jason, [10.04.19 22:23]
+# The last 3 720-block periods have been 1429, 1447, and 1435 minutes long.  Total number of stimulus
+# payments over those 3 is 1392, 1404, 1397, which puts avg stimulus time at between 61.6s and 61.8s,
+# or about 2.6-3.0% slower than 1 per minute.
+#Jason, [10.04.19 22:24]
+# And that means daily emission is running about 112000 rather than 115200
+STIMULUS_PER_DAY = 112000
+
+# One GRFT in atomic units
+GRFT = 10000000000
 
 
-
-# Enable logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
                     level=logging.INFO)
 
@@ -97,19 +114,17 @@ logger = logging.getLogger(__name__)
 pp = None
 globalsns = None
 lastresults = None
+lastheight = None
 updater = None
 notifications = {}
 
 print = partial(print, flush=True)
 
-tier_costs = (0, 50000, 90000, 150000, 250000)
-GRFT = 10000000000
-
 def tier(balance):
-    for i, c in enumerate(tier_costs):
+    for i, c in enumerate(TIER_COSTS):
         if balance < c * GRFT:
             return i - 1
-    return len(tier_costs) - 1
+    return len(TIER_COSTS) - 1
 
 
 def format_wallet(addr, markup='*', init_len=6):
@@ -219,7 +234,7 @@ def get_dist(results = None):
             t = g['tier']
             num_tiers[t] += 1
             total_balance += g['stake']
-            total_stakes += tier_costs[t] * GRFT
+            total_stakes += TIER_COSTS[t] * GRFT
 
     num_sns = sum(num_tiers[1:])
     if num_sns == 0:
@@ -238,8 +253,8 @@ def get_dist(results = None):
     for t, n in enumerate(num_tiers):
         if t == 0:
             continue
-        rroi = num_tiers[1]*tier_costs[1] / (n*tier_costs[t])
-        dist += ('T{}: ' + blocks[t-1] + " ({} = {:.1f}%; RROI = {:.1f}%)\n").format(t, n, pct_tiers[t], rroi*100)
+        roi = STIMULUS_PER_DAY * 30 / (len(TIER_COSTS)-1) / n / TIER_COSTS[t]
+        dist += ('T{}: ' + blocks[t-1] + " ({} = {:.1f}%; ROI = {:.2f}%)\n").format(t, n, pct_tiers[t], roi*100)
     dist += '{} supernode{} online and staked\n'.format(num_sns, 's' if num_sns != 1 else '')
     now = time.time()
     dist += 'Uptimes: *{}* ≤ _2m_, *{}* ≤ _10m_, *{}* ≤ _30m_, *{}* ≤ _1h_\n'.format(
@@ -296,7 +311,7 @@ async def get_json_data(urls, timeout=10):
 
 time_to_die = False
 def rta_updater():
-    global lastresults, time_to_die, updater, notifications
+    global lastresults, lastheight, time_to_die, updater, notifications
     last = 0
     first = ANNOUNCE_LIFE
     last_summary = time.time()
@@ -308,6 +323,8 @@ def rta_updater():
             if time.time() - last < 60:
                 time.sleep(1.0)
                 continue
+
+            lastheight = requests.get(NODES[0][1] + '/getheight', timeout=5).json()['height']
 
             results = loop.run_until_complete(get_json_data([
                 sn[1] + '/debug/supernode_list/1' for sn in SUPERNODES]))
@@ -531,6 +548,18 @@ def sn_value(pub, *, key=None, get=None, value_fmt="_{}_", none="_(none)_", join
     return join.join((none if k is None else value_fmt.format(k)) + sn_format.format(', '.join(v)) for k, v in results.items())
 
 
+def get_exp(r):
+    exp = r['StakeExpiringBlock'] if 'StakeExpiringBlock' in r else r['ExpiringBlock'] if 'ExpiringBlock' in r else None
+    if exp is None:
+        return None
+    global lastheight
+    minutes = 2 * (exp - lastheight)
+    return '{} (~{})'.format(exp,
+            '{} mins.'.format(minutes) if minutes <= 60 else
+            '{:.1f} hours'.format(minutes/60) if minutes <= 24*60 else
+            '{:.1f} days'.format(minutes/60/24))
+
+
 def sn_info(pub):
     global globalsns, lastresults
     if pub not in globalsns:
@@ -541,14 +570,14 @@ def sn_info(pub):
             return 'Sorry, I have never seen that supernode. 🙁'
         now = time.time()
         msgs = []
+
         msgs.append('*Tier:* ' + sn_value(pub, value_fmt='{}',
             get=lambda r: tier(r['StakeAmount']) if 'StakeAmount' in r else None))
         msgs.append('*Stake:* ' + sn_value(pub, join='\n*Stake:* ', value_fmt='{}',
             get=lambda r: '{:.10f} _GRFT_'.format(r['StakeAmount'] * 1e-10).rstrip('0').rstrip('.') if 'StakeAmount' in r else None))
         msgs.append('*Stake activated:* Block ' + sn_value(pub,
             get=lambda r: r['StakeFirstValidBlock'] if 'StakeFirstValidBlock' in r else None))
-        msgs.append('*Stake expiry:* Block ' + sn_value(pub,
-            get=lambda r: r['StakeExpiringBlock'] if 'StakeExpiringBlock' in r else r['ExpiringBlock'] if 'ExpiringBlock' in r else None))
+        msgs.append('*Stake expiry:* Block ' + sn_value(pub, get=get_exp))
         msgs.append('*Wallet:* ' + sn_value(pub, join='\n*Wallet:* ',
             get=lambda r: format_wallet(r['Address'], init_len=15, markup='') if 'Address' in r else None))
 
@@ -561,13 +590,17 @@ def sn_info(pub):
             if 'online_since' in sn:
                 msgs[-1] += " _({})_".format(friendly_ago(now - sn['online_since']))
             if mixed:
-                msgs[-1] += ' — ('+', '.join('_'+x+'_' for x in online_for)+')'
+                msgs[-1] += ' — '+', '.join('_'+x+'_' for x in online_for)
+            elif not 'offline_since' in sn and len(online_for) > 1:
+                msgs[-1] += ' — _{0}/{0} nodes_'.format(len(online_for))
         if 'offline_since' in sn or mixed:
             msgs.append("*Status:* 💔 offline")
             if 'offline_since' in sn:
                 msgs[-1] += " _({})_".format(friendly_ago(now - sn['offline_since']))
             if mixed:
-                msgs[-1] += ' — ('+', '.join('_'+x+'_' for x in offline_for)+')'
+                msgs[-1] += ' — '+', '.join('_'+x+'_' for x in offline_for)
+            elif not 'online_since' in sn and len(offline_for) > 1:
+                msgs[-1] += ' — _{0}/{0} nodes_'.format(len(offline_for))
         return '\n'.join(msgs)
 
 if TESTNET:
@@ -619,7 +652,18 @@ def show_sn(bot, update, user_data, args):
     if not replies:
         replies.append("Usage: /sn {PUBKEY|WALLET} -- shows information about matching supernodes")
 
-    send_reply(bot, update, "\n\n".join(replies))
+    msg = ''
+    count = 0
+    while count < len(replies):
+        if msg:
+            msg += '\n\n'
+        msg += replies[count]
+        count += 1
+        if count >= len(replies) or count % 3 == 0:
+            bot.send_message(
+                chat_id=update.message.chat_id,
+                text=msg, parse_mode=ParseMode.MARKDOWN)
+            msg = ''
 
 
 def track_sn(bot, update, user_data, args):
@@ -669,10 +713,26 @@ def show_tracking(bot, update, user_data, args):
 
     num = len(user_data['notify_about'])
     msg = 'Currently tracking *{}* SN{} for you:'.format(num, '' if num == 1 else 's')
-    for sn in sorted(user_data['notify_about']):
-        msg += "\n\n" + sn
-
     send_reply(bot, update, msg)
+
+    count = 0
+    def send_if_full(force=False):
+        nonlocal count, msg
+        count += 1
+        if msg and (count >= 3 or force):
+            bot.send_message(
+                chat_id=update.message.chat_id,
+                text=msg, parse_mode=ParseMode.MARKDOWN)
+            count = 0
+            msg = ''
+
+    for sn in sorted(user_data['notify_about']):
+        if msg:
+            msg += "\n\n"
+        msg += "*{}*:\n".format(sn)
+        msg += sn_info(sn) if sn in globalsns else '_Not found_'
+        send_if_full()
+    send_if_full(force=True)
 
 
 def filter_nodes(args, select_from=NODES, empty_means_all=True):
@@ -856,15 +916,20 @@ stickers = [
         'CAADAgADFAgAAgi3GQJfZ536CxC8DQI', # GC slap
         'CAADAgADhQMAAgi3GQJJ-luqZysfcQI', # Evil minds Hitler
         'CAADAgADewEAAooSqg4cZtyuQEZnqQI', # Kermit the frog strangled
+        'CAADAgADBgcAAnlc4glH5cgIGdkEZwI', # Trump pointing up
+        'CAADBAADHAsAAs31wASn1a-1aklUOQI', # cynanide and happiness - middle finger
+        'CAADAgADYwADA3L-DF5bb18_upCAAg', # Cointelegraph - scam slap
+        'CAADBAADIAEAAld3bgABzELnNgybyicC', # Doctor Who - weeping angel
+        'CAADAgADXgMAApzW5wp_iZO-robOUQI', # Capitalist - go back to work
+        'CAADAgADNgADhwR_DTPS5Hu9gALkAg', # Grumpy cat - die
+        'CAADAQADcwgAAr-MkASMxa85tFAxkgI', # Miss Alena - samurai
+        'CAADAgADOwMAAsSraAsRelUq-nKf7gI', # Gollum - triggered
+        'CAADAgADNwMAAsSraAu8M1Of1BlNMwI', # Gollum - nobody likes you
 ]
-last_sticker = -1
 @nospam
 def slap(bot, update, user_data):
-    global last_sticker
-    last_sticker = (last_sticker + 1) % len(stickers)
-
     reply_to = update.message.reply_to_message or update.message
-    reply_to.reply_sticker(sticker=stickers[last_sticker], quote=True)
+    reply_to.reply_sticker(sticker=random.choice(stickers), quote=True)
 
 
 def sticker_input(bot, update, user_data):
